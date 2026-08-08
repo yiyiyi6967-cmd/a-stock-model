@@ -3,7 +3,7 @@ import pandas as pd, numpy as np, akshare as ak
 from datetime import datetime,timedelta
 import requests,time,random,re
 
-st.set_page_config(page_title="A股短线模型 V5.4",page_icon="📈",layout="centered")
+st.set_page_config(page_title="A股短线模型 V5.5",page_icon="📈",layout="centered")
 st.markdown("""<style>.block-container{padding-top:1rem;max-width:860px}.box{border:1px solid rgba(128,128,128,.25);border-radius:16px;padding:14px;margin:8px 0}.big{font-size:1.3rem;font-weight:700}[data-testid="stMetricValue"]{font-size:1.2rem}</style>""",unsafe_allow_html=True)
 POS=["中标","签订","合同","回购","增持","预增","扭亏","分红","重大项目","战略合作","获批","订单","业绩增长"]
 NEG=["减持","解禁","立案","调查","处罚","诉讼","亏损","预亏","退市","风险提示","终止","违约","冻结","问询函"]
@@ -235,22 +235,103 @@ def similar(x, lookback=15, max_samples=60, min_gap=12):
     }
 
 def score(x,sim,n):
-    z=x.iloc[-1];c=float(z["收盘"]);t=50;s=50;sig=[]
-    t+=8 if c>=z.MA20 else -8;t+=10 if z.MA5>=z.MA10>=z.MA20 else 0;t+=7 if 38<=z.RSI<=68 else (-10 if z.RSI>75 else 0);t+=6 if z.MACDH>0 else 0;t+=5 if z.SLOPE20>0 else -5
-    p=x.iloc[-2]
-    if z["收盘"]<p["收盘"] and z.VR20<.75:s+=8;sig.append("✓ 缩量回落")
-    if z["收盘"]>p["收盘"] and z.VR20>1.35:s+=7;sig.append("✓ 放量上涨")
-    if z["收盘"]<p["收盘"] and z.VR20>1.5:s-=10;sig.append("⚠ 放量下跌")
-    if z.LOWER>.42:s+=6;sig.append("✓ 长下影承接")
-    if z.UPPER>.45:s-=5;sig.append("⚠ 长上影抛压")
-    hs=50 if not sim else int(np.clip(50+(sim["win"]-.5)*90+np.clip(sim["avg"]/.025,-1.5,1.5)*22+(sim["p55"]-.30)*18,0,100))
+    z=x.iloc[-1];p=x.iloc[-2]
+    c=float(z["收盘"]);o=float(z["开盘"]);h=float(z["最高"]);l=float(z["最低"])
+    rng=max(h-l,1e-8)
+    lower=float((min(o,c)-l)/rng)
+    upper=float((h-max(o,c))/rng)
+    close_pos=float((c-l)/rng)
+    body=abs(c-o)/rng
+    vr=float(z.VR20) if np.isfinite(z.VR20) else 1.0
+    ret=float(c/p["收盘"]-1)
+    atr=float(z.ATR) if np.isfinite(z.ATR) and z.ATR>0 else max(c*.02,1e-8)
+
+    # 趋势评分：连续变量，减少固定分扎堆
+    t=50.0
+    t += np.clip((c/z.MA20-1)/.04*15,-15,15) if np.isfinite(z.MA20) else 0
+    t += np.clip(float(z.SLOPE20)/.025*12,-12,12) if np.isfinite(z.SLOPE20) else 0
+    t += np.clip((float(z.RSI)-50)/25*10,-10,10) if np.isfinite(z.RSI) else 0
+    t += np.clip(float(z.MACDH)/atr*8,-8,8) if np.isfinite(z.MACDH) else 0
+    if np.isfinite(z.MA5) and np.isfinite(z.MA10) and np.isfinite(z.MA20):
+        t += 7 if z.MA5>=z.MA10>=z.MA20 else (-5 if z.MA5<=z.MA10<=z.MA20 else 0)
+
+    # 支撑距离：MA/近期低点越接近，当日下影越有解释力
+    supports=[q for q in [z.MA5,z.MA10,z.MA20,z.MA30,z.MA60,z.LOW20] if np.isfinite(q) and q>0]
+    support_dist=min([abs(l-q)/atr for q in supports],default=9.0)
+    near_support=support_dist<=0.55
+
+    # V5.5 承接强弱：不是看到长下影就叫“承接”
+    wick_score=0.0
+    if lower>=.30:
+        wick_score += np.clip((lower-.30)/.40*35,0,35)
+        wick_score += np.clip((close_pos-.55)/.35*25,0,25)
+        wick_score += 18 if near_support else 0
+        # 量能：温和放量/正常量更可信；巨量杀跌扣分
+        if .75<=vr<=1.8: wick_score += 12
+        elif vr<.45: wick_score -= 5
+        elif vr>2.2 and ret<0: wick_score -= 18
+        # 收盘重新站回开盘/前收附近
+        if c>=o: wick_score += 7
+        if c>=float(p["收盘"])*.995: wick_score += 5
+    wick_score=float(np.clip(wick_score,0,100))
+
+    if lower<.30:
+        wick_label="无明显长下影"
+    elif wick_score>=75:
+        wick_label="强承接"
+    elif wick_score>=55:
+        wick_label="疑似承接"
+    else:
+        wick_label="仅长下影，承接未确认"
+
+    # 量价评分改为连续评分
+    s=50.0
+    # 上涨配合放量、回落配合缩量加分；反过来扣分
+    if ret>0:
+        s += np.clip((vr-1.0)*16,-10,16)
+    elif ret<0:
+        s += np.clip((1.0-vr)*15,-18,12)
+    s += (wick_score-50)*.22
+    s -= np.clip((upper-.35)*30,0,12)
+    # 收盘位置越高越好
+    s += np.clip((close_pos-.5)*16,-8,8)
+
+    sig=[]
+    if ret<0 and vr<.75:
+        sig.append(f"✓ 缩量回落：20日量比 {vr:.2f}×")
+    elif ret>0 and vr>1.35:
+        sig.append(f"✓ 放量上涨：20日量比 {vr:.2f}×")
+    elif ret<0 and vr>1.50:
+        sig.append(f"⚠ 放量下跌：20日量比 {vr:.2f}×")
+    else:
+        sig.append(f"• 量能中性：20日量比 {vr:.2f}×")
+
+    sig.append(f"• 下影占振幅 {lower*100:.0f}% ｜ 收盘位置 {close_pos*100:.0f}% ｜ {wick_label}（{wick_score:.0f}/100）")
+    if near_support:
+        sig.append(f"• 当日低点距最近技术支撑约 {support_dist:.2f} ATR")
+    else:
+        sig.append("• 下影未发生在足够接近的技术支撑区域")
+    if upper>.45:
+        sig.append(f"⚠ 上影较长：占振幅 {upper*100:.0f}%")
+
+    hs=50 if not sim else int(np.clip(
+        50+(sim["win"]-.5)*90+np.clip(sim["avg"]/.025,-1.5,1.5)*22+(sim["p55"]-.30)*18,0,100))
     ns=50;sev=False
     if not n.empty:
         tc=next((q for q in n.columns if "标题" in str(q) or str(q).lower()=="title"),n.columns[0])
         for i,txt in enumerate(n[tc].astype(str)):
-            w=max(.25,1-i/35);ns+=min(6,2*sum(k in txt for k in POS))*w;ns-=min(9,3*sum(k in txt for k in NEG))*w
+            w=max(.25,1-i/35)
+            ns+=min(6,2*sum(k in txt for k in POS))*w
+            ns-=min(9,3*sum(k in txt for k in NEG))*w
             if any(k in txt for k in SEV):sev=True
-    return int(np.clip(t,0,100)),int(np.clip(s,0,100)),hs,int(np.clip(ns,0,100)),sev,sig
+
+    detail={
+        "vr20":vr,"ret":ret,"lower":lower,"upper":upper,
+        "close_pos":close_pos,"body":body,"wick_score":wick_score,
+        "wick_label":wick_label,"support_dist":support_dist,
+        "near_support":near_support
+    }
+    return int(np.clip(t,0,100)),int(np.clip(s,0,100)),hs,int(np.clip(ns,0,100)),sev,sig,detail
 
 def levels(x):
     z=x.iloc[-1];c=float(z["收盘"]);a=max(float(z.ATR),c*.008);mas=[float(z[f"MA{n}"]) for n in [5,10,20,30,60]]
@@ -263,8 +344,8 @@ def levels(x):
     else:lo=hi=np.nan
     return s1,s2,r1,r2,lo,hi,max(r1,float(z.HIGH20)*.995),(s1-.8*a if pull else c-1.25*a),max(r1,c+1.5*a),max(r2,c+2.4*a),pull
 
-st.title("📈 A股短线模型 V5.4")
-st.caption("真实K线形态相似 · 独立样本去重 · 交易期望 · 多源行情校验")
+st.title("📈 A股短线模型 V5.5")
+st.caption("量价真实性升级 · 承接强弱分级 · 真实K线形态相似 · 交易期望")
 code=st.text_input("输入6位A股代码",placeholder="例如：002159",max_chars=6)
 capital=st.number_input("模拟投入金额（元）",min_value=1000.0,max_value=10000000.0,value=10000.0,step=1000.0)
 
@@ -297,7 +378,7 @@ if st.button("开始分析",type="primary",use_container_width=True):
                         calc_turn=sinaq["volume"]/float_sh*100
                     except Exception:pass
 
-                n,nerr=get_news(code);sim=similar(x);ts,ps,hs,ns,sev,sigs=score(x,sim,n)
+                n,nerr=get_news(code);sim=similar(x);ts,ps,hs,ns,sev,sigs,qd=score(x,sim,n)
                 total=round(ts*.25+ps*.25+hs*.30+ns*.20)
                 if sim and sim["avg"]<=0:total=min(total,64)
                 if sim and sim["win"]<.5:total=min(total,66)
@@ -358,10 +439,14 @@ if st.button("开始分析",type="primary",use_container_width=True):
                 elif pull:st.write(f"回踩候选 **¥{lo:.2f}–¥{hi:.2f}**")
                 else:st.write("趋势条件不足，不生成机械回踩买点。")
                 st.write(f"突破确认约 **¥{bo:.2f}** ｜ 止损/无效参考 **¥{sl:.2f}** ｜ 目标1 ¥{t1:.2f} ｜ 目标2 ¥{t2:.2f}")
-                st.write("### 量价 / K线")
-                if sigs:
-                    for q in sigs:st.write("• "+q)
-                else:st.write("• 暂无突出结构")
+                st.write("### 量价 / K线真实性")
+                a,b,c=st.columns(3)
+                a.metric("20日量比",f"{qd['vr20']:.2f}×")
+                b.metric("下影占比",f"{qd['lower']*100:.0f}%")
+                c.metric("承接强度",f"{qd['wick_score']:.0f}/100")
+                st.write(f"**承接判断：{qd['wick_label']}**")
+                for q in sigs:st.write(q)
+                st.caption("“长下影”只描述K线形状；只有同时满足收盘位置、支撑距离和量能等条件，模型才升级为“疑似承接/强承接”。")
                 st.write("### 交易期望 / 是否值得参与")
                 if not sim:
                     st.warning("相似样本不足，暂不计算投资期望。")
@@ -423,5 +508,5 @@ if st.button("开始分析",type="primary",use_container_width=True):
                     tc=next((q for q in n.columns if "标题" in str(q) or str(q).lower()=="title"),n.columns[0])
                     for t in n[tc].head(8):st.write("• "+str(t))
                 st.line_chart(x.tail(80).set_index("日期")[["收盘","MA5","MA10","MA20","MA30","MA60"]])
-                st.warning("V5.4使用公开行情接口，不是券商交易接口。实时数据和换手率估算可能存在延迟/口径差异；数据冲突时自动暂停信号。")
+                st.warning("V5.5使用公开行情接口，不是券商交易接口。实时数据和换手率估算可能存在延迟/口径差异；数据冲突时自动暂停信号。")
             except Exception as e:st.error("计算异常："+str(e))
