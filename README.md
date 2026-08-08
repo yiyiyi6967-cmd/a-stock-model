@@ -1,16 +1,10 @@
-# A股短线模型 V4.1
+# A股短线模型 V2 · 手机网页
 
-针对 Streamlit Cloud 上 RemoteDisconnected 问题的容错更新。
+## 本地运行
+pip install -r requirements.txt
+streamlit run app.py
 
-改进：
-- 东方财富行情失败自动重试3次
-- 自动切换新浪备用日线源
-- 新闻接口独立重试
-- 新闻失败不再让整个分析失败
-- 消息不可用时按中性50分处理并明确提示
-- 页面显示当前使用的行情数据源
-- 可展开查看行情接口错误
+## 手机使用
+推荐部署到 Streamlit Community Cloud。把 app.py 和 requirements.txt 上传到 GitHub 仓库，然后在 Streamlit Community Cloud 创建 App，入口选择 app.py。部署后会得到固定网址，安卓/iPhone浏览器均可打开，也可以添加到手机桌面。
 
-## 从V4更新
-GitHub原仓库中替换 app.py 和 requirements.txt，然后 Commit changes。
-原 Streamlit URL 不变。通常会自动重新部署。
+注意：V2 是无需预训练模型文件的轻量分析版，方便云端直接启动。它不是自动交易程序，也不保证收益。
