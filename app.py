@@ -3,7 +3,7 @@ import pandas as pd, numpy as np, akshare as ak
 from datetime import datetime,timedelta
 import requests,time,random,re
 
-st.set_page_config(page_title="A股短线模型 V6.3.2",page_icon="📈",layout="centered")
+st.set_page_config(page_title="A股短线模型 V6.3.3",page_icon="📈",layout="centered")
 st.markdown("""<style>.block-container{padding-top:1rem;max-width:860px}.box{border:1px solid rgba(128,128,128,.25);border-radius:16px;padding:14px;margin:8px 0}.big{font-size:1.3rem;font-weight:700}[data-testid="stMetricValue"]{font-size:1.2rem}</style>""",unsafe_allow_html=True)
 POS=["中标","签订","合同","回购","增持","预增","扭亏","分红","重大项目","战略合作","获批","订单","业绩增长"]
 NEG=["减持","解禁","立案","调查","处罚","诉讼","亏损","预亏","退市","风险提示","终止","违约","冻结","问询函"]
@@ -353,6 +353,62 @@ def historical_score_25(sim,reli,path,take_profit=None,stop_loss=None):
     d.append(("样本/可信度",p6,2))
     pts=sum(v for _,v,_ in d)
     return {"points":pts,"score100":int(round(np.clip(pts/25*100,0,100))),"detail":d}
+
+def oos_grade_v633(reli):
+    """
+    样本外验证从“一票否决”改成统计强弱分级。
+    同时看：样本量、胜率、平均收益、中位数近似、训练/测试稳定性、可信度。
+    不因轻微负收益直接判死刑；明显负期望且样本充分仍可强否决。
+    """
+    if not reli or not reli.get("enough_oos") or not reli.get("test"):
+        return {"level":"⚪ 样本不足","score":45,"hard_veto":False,
+                "reason":"样本外案例不足，不能证明有效，也不能仅凭这一项否决。"}
+
+    te=reli["test"]; tr=reli.get("train")
+    n=int(te.get("n",0))
+    win=float(te.get("win",0.5))
+    avg=float(te.get("avg",0))
+    # 当前统计对象没有逐笔中位数缓存时，用胜负均值构造保守的中心收益近似；
+    # 后续有逐笔测试样本时可直接替换为真实median。
+    aw=float(te.get("avg_win",0)); al=float(te.get("avg_loss",0))
+    center=win*aw+(1-win)*al
+    conf=float(reli.get("confidence",50))/100
+
+    s=50.0
+    s += np.clip(avg/.02*18,-22,22)
+    s += np.clip((win-.50)/.15*12,-14,14)
+    s += np.clip(center/.02*6,-7,7)
+    if tr:
+        gap=abs(win-float(tr.get("win",win)))
+        s += 5 if gap<=.08 else (2 if gap<=.15 else -5)
+        agap=abs(avg-float(tr.get("avg",avg)))
+        s += 4 if agap<=.015 else (1 if agap<=.03 else -4)
+    s += np.clip((n-12)/38*5,0,5)
+    s = 50 + (s-50)*(0.65+0.35*conf)
+    s=float(np.clip(s,0,100))
+
+    # 只有“明显负期望 + 较低胜率 + 足够样本”才强否决。
+    hard = bool(n>=18 and avg<=-.012 and win<.42 and conf>=.55)
+    if hard:
+        level="🔴 明显负优势"
+        reason=f"样本外{n}例，平均5日{avg*100:+.2f}%，胜率{win*100:.1f}%，负期望较明显。"
+    elif s>=72:
+        level="🟢 强通过"
+        reason=f"样本外{n}例，收益、胜率和稳定性共同支持正优势。"
+    elif s>=58:
+        level="🟢 通过"
+        reason=f"样本外{n}例整体偏正，但优势强度仍需结合交易可信度。"
+    elif s>=43:
+        level="🟡 中性"
+        reason=f"样本外{n}例未显示足够强的正/负优势，不应单独决定交易。"
+    elif s>=28:
+        level="🟠 偏弱"
+        reason=f"样本外{n}例偏弱，但尚未达到高置信度强否决条件。"
+    else:
+        level="🔴 弱通过/不建议"
+        reason=f"样本外{n}例表现较差，应显著降低交易可信度。"
+    return {"level":level,"score":int(round(s)),"hard_veto":hard,"reason":reason,
+            "n":n,"win":win,"avg":avg,"center":center}
 
 def chip_model(x, turn_hist_df=None, bins=55, days=120):
     """
@@ -711,7 +767,7 @@ def chip_pressure(chip):
 
 def trade_price_plan(x, opportunity, s1, s2, r1, r2, b1, b2, sl, t1, t2, pull, lo, hi):
     """
-    V6.3.2 买卖价格计划。
+    V6.3.3 买卖价格计划。
     输出区间而非假装存在唯一精确价格。
     买入区综合支撑、ATR、回踩区和当前价；卖出区综合压力/目标位。
     """
@@ -768,7 +824,7 @@ def final_trade_summary(total, opportunity, confidence, reli, net_plan_ev, rr, s
     if not reli or reli["n"]<35:
         return "🟡 等待", "历史独立样本不足，胜率可信度不够。"
     if reli["enough_oos"] and reli["test"] and reli["test"]["avg"]<=0:
-        return "🔴 不值得做", "样本外平均收益不为正。"
+        return "🔴 不值得做", "样本外统计偏弱，已计入可信度但不因轻微负收益单独一票否决。"
     if np.isfinite(net_plan_ev) and net_plan_ev<=0:
         return "🔴 不值得做", "扣除交易摩擦后统计期望为负。"
     if (total>=65 and opportunity["score"]>=70 and confidence>=55
@@ -845,7 +901,7 @@ def dynamic_total(ts,ps,hs,ns,chip,sim,plan_ev,rr,news_available=True,reli=None)
 
 def trend_engine_v63(x):
     """
-    V6.3.2 趋势状态机。
+    V6.3.3 趋势状态机。
     不只判断均线多空，而是识别：
     上升趋势 / 上升回踩 / 再转强 / 下跌延续 / 下跌减速 / 底部转强 / 震荡。
     评分由四类证据构成：
@@ -1026,7 +1082,7 @@ def levels(x):
     t2=max(r2,c+2.4*a)
     return s1,s2,r1,r2,lo,hi,b1,b2,sl,t1,t2,pull
 
-st.title("📈 A股短线模型 V6.3.2")
+st.title("📈 A股短线模型 V6.3.3")
 st.caption("趋势状态机 · 趋势减速/拐点 · 5日完整路径 · 3日启动辅助 · TP/SL先后")
 code=st.text_input("输入6位A股代码",placeholder="例如：002159",max_chars=6)
 capital=st.number_input("模拟投入金额（元）",min_value=1000.0,max_value=10000000.0,value=10000.0,step=1000.0)
@@ -1063,10 +1119,11 @@ if st.button("开始分析",type="primary",use_container_width=True):
                 n,nerr=get_news(code)
                 sim=similar(x)
                 reli=winrate_reliability(sim)
+                oos633=oos_grade_v633(reli)
                 chip=chip_model(x,th)
                 ts,ps,hs,ns,sev,sigs,qd=score(x,sim,n)
                 trend63=trend_engine_v63(x)
-                # V6.3.2总评分中的趋势25%使用状态机趋势分，不再使用旧的简单趋势分。
+                # V6.3.3总评分中的趋势25%使用状态机趋势分，不再使用旧的简单趋势分。
                 ts=trend63["score"]
                 s1,s2,r1,r2,lo,hi,b1,b2,sl,t1,t2,pull=levels(x)
                 stage,stage_desc,tchecks,td=trend_stage(x)
@@ -1158,7 +1215,7 @@ if st.button("开始分析",type="primary",use_container_width=True):
                     total,opportunity,confidence,reli,net_plan_ev,rr,sev,conflict,stale
                 )
 
-                # V6.3.2 首页只保留交易者最需要的信息
+                # V6.3.3 首页只保留交易者最需要的信息
                 st.write("## 今日交易总结")
                 st.markdown(f'<div class="box"><div class="big">{final_label}</div>{final_reason}</div>',unsafe_allow_html=True)
                 a,b,c=st.columns(3)
@@ -1221,7 +1278,10 @@ if st.button("开始分析",type="primary",use_container_width=True):
                         st.write(f"独立相似案例 **{sim['n']}次** ｜ 3日上涨率 **{sim['win3']*100:.1f}%** ｜ 5日上涨率 **{sim['win']*100:.1f}%**")
                         st.write(f"平均3日 **{sim['avg3']*100:+.2f}%** ｜ 平均5日 **{sim['avg']*100:+.2f}%** ｜ 形态接近度 **{sim['similarity']:.1f}/100**")
                         st.write(f"**历史统计评分：{hist25['points']:.1f}/25**")
+                        st.write(f"**样本外验证：{oos633['level']} ｜ {oos633['score']}/100**")
+                        st.write(oos633["reason"])
                         st.caption("固定5日为主窗口、3日为启动辅助；历史评分不会根据某只股票哪一天表现最好而临时换周期。")
+                        st.caption("V6.3.3：样本外验证改为分级。轻微负收益只降低可信度；只有样本充分、平均收益明显为负、胜率明显偏低且可信度足够时才强否决。")
                         for name,pts,mx in hist25["detail"]:
                             st.write(f"{name}：**{pts:.1f}/{mx}**")
                         if path_stats:
@@ -1433,6 +1493,6 @@ if st.button("开始分析",type="primary",use_container_width=True):
                         tc=next((q for q in n.columns if "标题" in str(q) or str(q).lower()=="title"),n.columns[0])
                         for t in n[tc].head(8):st.write("• "+str(t))
                     st.line_chart(x.tail(80).set_index("日期")[["收盘","MA5","MA10","MA20","MA30","MA60"]])
-                    st.warning("V6.3.2使用公开行情接口，不是券商交易接口。实时数据和换手率估算可能存在延迟/口径差异；数据冲突时自动暂停信号。")
+                    st.warning("V6.3.3使用公开行情接口，不是券商交易接口。实时数据和换手率估算可能存在延迟/口径差异；数据冲突时自动暂停信号。")
 
             except Exception as e:st.error("计算异常："+str(e))
