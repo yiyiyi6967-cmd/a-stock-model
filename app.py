@@ -3,7 +3,7 @@ import pandas as pd, numpy as np, akshare as ak
 from datetime import datetime,timedelta
 import requests,time,random,re
 
-st.set_page_config(page_title="A股短线模型 V6.1",page_icon="📈",layout="centered")
+st.set_page_config(page_title="A股短线模型 V6.3",page_icon="📈",layout="centered")
 st.markdown("""<style>.block-container{padding-top:1rem;max-width:860px}.box{border:1px solid rgba(128,128,128,.25);border-radius:16px;padding:14px;margin:8px 0}.big{font-size:1.3rem;font-weight:700}[data-testid="stMetricValue"]{font-size:1.2rem}</style>""",unsafe_allow_html=True)
 POS=["中标","签订","合同","回购","增持","预增","扭亏","分红","重大项目","战略合作","获批","订单","业绩增长"]
 NEG=["减持","解禁","立案","调查","处罚","诉讼","亏损","预亏","退市","风险提示","终止","违约","冻结","问询函"]
@@ -223,7 +223,9 @@ def similar(x, lookback=15, max_samples=60, min_gap=12):
         "p35":float(np.mean([q["r3max"]>=.05 for q in rec])),
         "p55":float(np.mean([q["r5max"]>=.05 for q in rec])),
         "win":float((rr>0).mean()),
+        "win3":float((r3>0).mean()),
         "avg":float(rr.mean()),
+        "avg3":float(r3.mean()),
         "avg_win":float(wins.mean()) if len(wins) else 0.0,
         "avg_loss":float(losses.mean()) if len(losses) else 0.0,
         "q25":float(q25),"q50":float(q50),"q75":float(q75),
@@ -297,6 +299,56 @@ def winrate_reliability(sim):
             "conservative":conservative,"train":tr,"test":te,
             "enough_oos":enough_oos,"confidence":conf}
 
+
+def path_trade_stats(sim,take_profit,stop_loss):
+    if not sim or not sim.get("all_cases") or take_profit<=0 or stop_loss<=0:return None
+    wins=losses=unresolved=0
+    for q in sim["all_cases"]:
+        tp=q["r5max"]>=take_profit
+        sl=q["dd"]<=-stop_loss
+        # 日K无法知道同日先后；两者都碰到时保守按止损。
+        if tp and sl: losses+=1
+        elif tp: wins+=1
+        elif sl: losses+=1
+        else: unresolved+=1
+    resolved=wins+losses
+    return {"wins":wins,"losses":losses,"unresolved":unresolved,"resolved":resolved,
+            "win":wins/resolved if resolved else np.nan}
+
+def historical_score_25(sim,reli,path,take_profit=None,stop_loss=None):
+    if not sim or not reli:return {"points":0.0,"score100":0,"detail":[]}
+    d=[]
+    if path and path["resolved"]>=10 and np.isfinite(path["win"]):
+        p1=float(np.clip(4+(path["win"]-.5)/.15*4,0,8))
+    else:p1=2.0
+    d.append(("5日TP/SL先后胜率",p1,8))
+
+    ev=float(sim["avg"])
+    if (path and path["resolved"] and np.isfinite(path["win"])
+        and take_profit is not None and stop_loss is not None):
+        path_ev=path["win"]*take_profit-(1-path["win"])*stop_loss
+        ev=.60*path_ev+.40*ev
+    p2=float(np.clip(3+ev/.02*3,0,6))
+    d.append(("5日平均收益",p2,6))
+
+    p3=float(np.clip(1.5+(sim["win3"]-.5)/.18+sim["avg3"]/.02*.5,0,3))
+    d.append(("3日启动速度",p3,3))
+
+    up=max(float(sim["maxup"]),0);down=abs(min(float(sim["dd"]),0))
+    pr=up/max(down,1e-6)
+    p4=float(np.clip(1.5+(pr-1)*.75,0,3))
+    d.append(("5日上行/回撤",p4,3))
+
+    p5=1.0
+    if reli["enough_oos"] and reli["test"] and reli["train"]:
+        te,tr=reli["test"],reli["train"]
+        p5=1.5 + (.75 if te["avg"]>0 else -.5) + (.75 if abs(te["win"]-tr["win"])<=.10 else 0)
+    d.append(("样本外稳定",float(np.clip(p5,0,3)),3))
+
+    p6=float(2*(.45*np.clip((reli["n"]-15)/85,0,1)+.55*np.clip(reli["confidence"]/100,0,1)))
+    d.append(("样本/可信度",p6,2))
+    pts=sum(v for _,v,_ in d)
+    return {"points":pts,"score100":int(round(np.clip(pts/25*100,0,100))),"detail":d}
 
 def chip_model(x, turn_hist_df=None, bins=55, days=120):
     """
@@ -655,7 +707,7 @@ def chip_pressure(chip):
 
 def trade_price_plan(x, opportunity, s1, s2, r1, r2, b1, b2, sl, t1, t2, pull, lo, hi):
     """
-    V6.1 买卖价格计划。
+    V6.3 买卖价格计划。
     输出区间而非假装存在唯一精确价格。
     买入区综合支撑、ATR、回踩区和当前价；卖出区综合压力/目标位。
     """
@@ -787,6 +839,113 @@ def dynamic_total(ts,ps,hs,ns,chip,sim,plan_ev,rr,news_available=True,reli=None)
     total=sum(s*w for _,s,w in parts)/denom if denom else 50
     return int(round(np.clip(total,0,100))),parts
 
+def trend_engine_v63(x):
+    """
+    V6.3 趋势状态机。
+    不只判断均线多空，而是识别：
+    上升趋势 / 上升回踩 / 再转强 / 下跌延续 / 下跌减速 / 底部转强 / 震荡。
+    评分由四类证据构成：
+      方向40、斜率与加速度25、价格结构20、确认15。
+    """
+    z=x.iloc[-1]
+    c=float(z["收盘"])
+    def safe(v,default=0):
+        return float(v) if np.isfinite(v) else default
+    ma5,ma10,ma20,ma30,ma60=[safe(z[k],c) for k in ["MA5","MA10","MA20","MA30","MA60"]]
+    rsi=safe(z.RSI,50)
+    macdh=safe(z.MACDH,0)
+
+    # MA20 normalized slopes over several horizons: level + acceleration
+    m=x["MA20"].astype(float)
+    s_now=(m.iloc[-1]/m.iloc[-4]-1) if len(m)>=4 and np.isfinite(m.iloc[-4]) and m.iloc[-4]!=0 else 0
+    s_prev=(m.iloc[-4]/m.iloc[-7]-1) if len(m)>=7 and np.isfinite(m.iloc[-7]) and m.iloc[-7]!=0 else s_now
+    accel=s_now-s_prev
+
+    # Price structure: compare recent swing windows rather than only current MA.
+    hi5=float(x["最高"].tail(5).max()); lo5=float(x["最低"].tail(5).min())
+    hi_prev=float(x["最高"].iloc[-10:-5].max()) if len(x)>=10 else hi5
+    lo_prev=float(x["最低"].iloc[-10:-5].min()) if len(x)>=10 else lo5
+    higher_high=hi5>hi_prev
+    higher_low=lo5>lo_prev
+    lower_high=hi5<hi_prev
+    lower_low=lo5<lo_prev
+
+    # 1. Direction 0-40
+    direction=20.0
+    if ma5>ma10>ma20: direction+=10
+    elif ma5<ma10<ma20: direction-=10
+    if c>ma20: direction+=6
+    else: direction-=6
+    if ma20>ma60: direction+=4
+    else: direction-=4
+    direction=float(np.clip(direction,0,40))
+
+    # 2. Slope + acceleration 0-25
+    slope_score=12.5
+    slope_score += np.clip(s_now/.015*7,-7,7)
+    slope_score += np.clip(accel/.012*5.5,-5.5,5.5)
+    slope_score=float(np.clip(slope_score,0,25))
+
+    # 3. Price structure 0-20
+    structure=10.0
+    if higher_high:structure+=5
+    if higher_low:structure+=5
+    if lower_high:structure-=4
+    if lower_low:structure-=6
+    structure=float(np.clip(structure,0,20))
+
+    # 4. Confirmation 0-15
+    confirm=7.5
+    if macdh>0:confirm+=3
+    else:confirm-=2
+    if 45<=rsi<=68:confirm+=2.5
+    elif rsi<30:confirm-=1
+    elif rsi>75:confirm-=2
+    if ma5>ma10:confirm+=2
+    else:confirm-=1
+    confirm=float(np.clip(confirm,0,15))
+
+    score=int(round(np.clip(direction+slope_score+structure+confirm,0,100)))
+
+    # State machine: state is not simply score bucket.
+    if s_now>0 and c>=ma20 and ma5>=ma10 and higher_low:
+        if c<hi_prev and c<=ma5*1.015:
+            state="🟢 上升趋势回踩"
+            desc="中期斜率仍向上，价格回到短期成本附近且低点未破坏，属于顺势回踩候选。"
+        elif higher_high:
+            state="🟢 上升趋势 / 再转强"
+            desc="均线方向、斜率和价格结构同时偏强。"
+        else:
+            state="🟢 上升趋势"
+            desc="价格位于MA20上方且趋势斜率为正，但突破结构仍需继续确认。"
+    elif s_now<0 and accel>0 and (higher_low or not lower_low):
+        if ma5>=ma10 and macdh>0:
+            state="🟠 底部转强候选"
+            desc="MA20仍偏下，但下降速度明显减慢，短均线和动能开始改善；属于反转候选，不等于反转已经确认。"
+        else:
+            state="🟡 下跌趋势减速"
+            desc="趋势仍偏弱，但MA20下降速度减慢，价格结构不再明显创新低，需等待进一步确认。"
+    elif s_now<0 and accel<=0 and c<ma20 and lower_low:
+        state="🔴 下跌趋势延续"
+        desc="价格位于MA20下方、斜率仍负且近期低点继续下移，接飞刀风险较高。"
+    elif abs(s_now)<.004 and not lower_low:
+        state="🟡 震荡 / 筑底观察"
+        desc="趋势斜率接近走平，价格结构暂未继续恶化，等待突破或转强确认。"
+    else:
+        state="⚪ 趋势过渡"
+        desc="多空证据混合，尚未形成稳定趋势状态。"
+
+    return {
+        "score":score,"state":state,"desc":desc,
+        "direction":direction,"slope_score":slope_score,
+        "structure":structure,"confirm":confirm,
+        "s_now":s_now,"s_prev":s_prev,"accel":accel,
+        "higher_high":higher_high,"higher_low":higher_low,
+        "lower_high":lower_high,"lower_low":lower_low,
+        "close":c,"ma5":ma5,"ma10":ma10,"ma20":ma20,"ma60":ma60,
+        "rsi":rsi,"macdh":macdh
+    }
+
 def trend_stage(x):
     z=x.iloc[-1]; p=x.iloc[-2]
     c=float(z["收盘"])
@@ -863,8 +1022,8 @@ def levels(x):
     t2=max(r2,c+2.4*a)
     return s1,s2,r1,r2,lo,hi,b1,b2,sl,t1,t2,pull
 
-st.title("📈 A股短线模型 V6.1")
-st.caption("一屏交易总结 · 建议买卖区间 · 股票质量 · 当前机会 · 交易可信度")
+st.title("📈 A股短线模型 V6.3")
+st.caption("趋势状态机 · 趋势减速/拐点 · 5日完整路径 · 3日启动辅助 · TP/SL先后")
 code=st.text_input("输入6位A股代码",placeholder="例如：002159",max_chars=6)
 capital=st.number_input("模拟投入金额（元）",min_value=1000.0,max_value=10000000.0,value=10000.0,step=1000.0)
 
@@ -902,6 +1061,9 @@ if st.button("开始分析",type="primary",use_container_width=True):
                 reli=winrate_reliability(sim)
                 chip=chip_model(x,th)
                 ts,ps,hs,ns,sev,sigs,qd=score(x,sim,n)
+                trend63=trend_engine_v63(x)
+                # V6.3总评分中的趋势25%使用状态机趋势分，不再使用旧的简单趋势分。
+                ts=trend63["score"]
                 s1,s2,r1,r2,lo,hi,b1,b2,sl,t1,t2,pull=levels(x)
                 stage,stage_desc,tchecks,td=trend_stage(x)
 
@@ -923,6 +1085,10 @@ if st.button("开始分析",type="primary",use_container_width=True):
                     wr_source="不可用"
                 plan_ev=(wr*plan_up-(1-wr)*plan_down) if np.isfinite(wr) else np.nan
                 rr=(plan_up/plan_down) if plan_down>0 else np.nan
+                path_stats=path_trade_stats(sim,plan_up,plan_down)
+                hist25=historical_score_25(sim,reli,path_stats,plan_up,plan_down)
+                if sim and reli:
+                    hs=hist25["score100"]
                 expected_yuan=capital*plan_ev if np.isfinite(plan_ev) else np.nan
                 win_yuan=capital*plan_up
                 loss_yuan=capital*plan_down
@@ -988,7 +1154,7 @@ if st.button("开始分析",type="primary",use_container_width=True):
                     total,opportunity,confidence,reli,net_plan_ev,rr,sev,conflict,stale
                 )
 
-                # V6.1 首页只保留交易者最需要的信息
+                # V6.3 首页只保留交易者最需要的信息
                 st.write("## 今日交易总结")
                 st.markdown(f'<div class="box"><div class="big">{final_label}</div>{final_reason}</div>',unsafe_allow_html=True)
                 a,b,c=st.columns(3)
@@ -1027,16 +1193,40 @@ if st.button("开始分析",type="primary",use_container_width=True):
                     ["趋势","历史相似","筹码","量价/K线","胜率/期望","消息","全部详情"]
                 )
                 with tab_trend:
-                    st.write(f"**{stage}**")
-                    st.write(stage_desc)
-                    st.write(f"收盘 ¥{td['close']:.2f} ｜ MA20 ¥{td['ma20']:.2f} ｜ MA20斜率 {td['slope20']*100:+.2f}% ｜ RSI {td['rsi']:.1f}")
+                    st.write(f"### {trend63['state']}")
+                    st.write(trend63["desc"])
+                    st.write(f"**趋势评分：{trend63['score']}/100**")
+                    a,b=st.columns(2)
+                    a.metric("方向",f"{trend63['direction']:.1f}/40")
+                    b.metric("斜率/加速度",f"{trend63['slope_score']:.1f}/25")
+                    a.metric("价格结构",f"{trend63['structure']:.1f}/20")
+                    b.metric("趋势确认",f"{trend63['confirm']:.1f}/15")
+                    st.write(f"MA20近3日斜率 **{trend63['s_now']*100:+.2f}%** ｜ 前一阶段 **{trend63['s_prev']*100:+.2f}%** ｜ 加速度变化 **{trend63['accel']*100:+.2f}%**")
+                    structure_txt=[]
+                    if trend63["higher_high"]:structure_txt.append("高点抬高")
+                    if trend63["higher_low"]:structure_txt.append("低点抬高")
+                    if trend63["lower_high"]:structure_txt.append("高点下移")
+                    if trend63["lower_low"]:structure_txt.append("低点下移")
+                    st.write("价格结构：" + (" / ".join(structure_txt) if structure_txt else "暂无明确高低点结构"))
+                    st.write(f"收盘 ¥{trend63['close']:.2f} ｜ MA5 ¥{trend63['ma5']:.2f} ｜ MA10 ¥{trend63['ma10']:.2f} ｜ MA20 ¥{trend63['ma20']:.2f} ｜ MA60 ¥{trend63['ma60']:.2f}")
+                    st.write(f"RSI {trend63['rsi']:.1f} ｜ MACD柱 {trend63['macdh']:+.4f}")
                     st.write(f"支撑 ¥{s1:.2f}/¥{s2:.2f} ｜ 压力 ¥{r1:.2f}/¥{r2:.2f}")
+                    st.caption("趋势状态机用于识别趋势阶段，不保证未来方向。尤其“底部转强候选”只表示下降减速并出现确认信号，不等于已经反转。")
                 with tab_history:
                     if sim:
-                        st.write(f"独立相似案例 **{sim['n']}次** ｜ 5日上涨率 **{sim['win']*100:.1f}%** ｜ 平均5日 **{sim['avg']*100:+.2f}%**")
-                        st.write(f"形态接近度 **{sim['similarity']:.1f}/100**")
+                        st.write(f"独立相似案例 **{sim['n']}次** ｜ 3日上涨率 **{sim['win3']*100:.1f}%** ｜ 5日上涨率 **{sim['win']*100:.1f}%**")
+                        st.write(f"平均3日 **{sim['avg3']*100:+.2f}%** ｜ 平均5日 **{sim['avg']*100:+.2f}%** ｜ 形态接近度 **{sim['similarity']:.1f}/100**")
+                        st.write(f"**历史统计评分：{hist25['points']:.1f}/25**")
+                        st.caption("固定5日为主窗口、3日为启动辅助；历史评分不会根据某只股票哪一天表现最好而临时换周期。")
+                        for name,pts,mx in hist25["detail"]:
+                            st.write(f"{name}：**{pts:.1f}/{mx}**")
+                        if path_stats:
+                            st.write(f"5日路径：先止盈 **{path_stats['wins']}** ｜ 先止损 **{path_stats['losses']}** ｜ 未触发 **{path_stats['unresolved']}**")
+                            if path_stats["resolved"]:
+                                st.write(f"已决案例交易胜率 **{path_stats['win']*100:.1f}%**")
+                            st.caption("同一日同时触及止盈和止损时，日K无法判断先后，模型保守按止损先触发。")
                         for q in sim["cases"]:
-                            st.write(f"{q['date'].date()} ｜ 5日 {q['r5']*100:+.2f}% ｜ 最高 {q['r5max']*100:+.2f}% ｜ 回撤 {q['dd']*100:.2f}%")
+                            st.write(f"{q['date'].date()} ｜ 3日 {q['r3']*100:+.2f}% ｜ 5日 {q['r5']*100:+.2f}% ｜ 最高 {q['r5max']*100:+.2f}% ｜ 回撤 {q['dd']*100:.2f}%")
                     else:
                         st.warning("独立历史形态样本不足。")
                 with tab_chip:
@@ -1052,7 +1242,9 @@ if st.button("开始分析",type="primary",use_container_width=True):
                     for q in sigs: st.write(q)
                 with tab_expect:
                     if reli:
-                        st.write(f"原始胜率 **{reli['raw']*100:.1f}%** ｜ 贝叶斯 **{reli['bayes']*100:.1f}%** ｜ 保守胜率 **{reli['conservative']*100:.1f}%**")
+                        st.write(f"5日原始胜率 **{reli['raw']*100:.1f}%** ｜ 贝叶斯 **{reli['bayes']*100:.1f}%** ｜ 保守胜率 **{reli['conservative']*100:.1f}%**")
+                        st.write(f"3日上涨率 **{sim['win3']*100:.1f}%**")
+                        st.caption("固定5日为主验证窗口，3日只评价启动速度；不根据哪一天表现最好临时挑周期。")
                         st.write(f"95%区间 {reli['lo']*100:.1f}%–{reli['hi']*100:.1f}% ｜ 可信度 {reli['confidence']:.0f}/100")
                     if sim:
                         st.write(f"计划盈亏比 **{rr:.2f}:1** ｜ 毛期望 **{plan_ev*100:+.2f}%** ｜ 摩擦后期望 **{net_plan_ev*100:+.2f}%**")
@@ -1237,6 +1429,6 @@ if st.button("开始分析",type="primary",use_container_width=True):
                         tc=next((q for q in n.columns if "标题" in str(q) or str(q).lower()=="title"),n.columns[0])
                         for t in n[tc].head(8):st.write("• "+str(t))
                     st.line_chart(x.tail(80).set_index("日期")[["收盘","MA5","MA10","MA20","MA30","MA60"]])
-                    st.warning("V6.1使用公开行情接口，不是券商交易接口。实时数据和换手率估算可能存在延迟/口径差异；数据冲突时自动暂停信号。")
+                    st.warning("V6.3使用公开行情接口，不是券商交易接口。实时数据和换手率估算可能存在延迟/口径差异；数据冲突时自动暂停信号。")
 
             except Exception as e:st.error("计算异常："+str(e))
