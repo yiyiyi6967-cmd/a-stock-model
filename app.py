@@ -3,7 +3,7 @@ import pandas as pd, numpy as np, akshare as ak
 from datetime import datetime,timedelta
 import requests,time,random,re
 
-st.set_page_config(page_title="A股短线模型 V5.6",page_icon="📈",layout="centered")
+st.set_page_config(page_title="A股短线模型 V5.7",page_icon="📈",layout="centered")
 st.markdown("""<style>.block-container{padding-top:1rem;max-width:860px}.box{border:1px solid rgba(128,128,128,.25);border-radius:16px;padding:14px;margin:8px 0}.big{font-size:1.3rem;font-weight:700}[data-testid="stMetricValue"]{font-size:1.2rem}</style>""",unsafe_allow_html=True)
 POS=["中标","签订","合同","回购","增持","预增","扭亏","分红","重大项目","战略合作","获批","订单","业绩增长"]
 NEG=["减持","解禁","立案","调查","处罚","诉讼","亏损","预亏","退市","风险提示","终止","违约","冻结","问询函"]
@@ -237,16 +237,17 @@ def similar(x, lookback=15, max_samples=60, min_gap=12):
 def score(x,sim,n):
     z=x.iloc[-1];p=x.iloc[-2]
     c=float(z["收盘"]);o=float(z["开盘"]);h=float(z["最高"]);l=float(z["最低"])
+    pc=float(p["收盘"])
     rng=max(h-l,1e-8)
     lower=float((min(o,c)-l)/rng)
     upper=float((h-max(o,c))/rng)
     close_pos=float((c-l)/rng)
     body=abs(c-o)/rng
     vr=float(z.VR20) if np.isfinite(z.VR20) else 1.0
-    ret=float(c/p["收盘"]-1)
+    ret=float(c/pc-1)
     atr=float(z.ATR) if np.isfinite(z.ATR) and z.ATR>0 else max(c*.02,1e-8)
 
-    # 趋势评分：连续变量，减少固定分扎堆
+    # 趋势评分
     t=50.0
     t += np.clip((c/z.MA20-1)/.04*15,-15,15) if np.isfinite(z.MA20) else 0
     t += np.clip(float(z.SLOPE20)/.025*12,-12,12) if np.isfinite(z.SLOPE20) else 0
@@ -255,46 +256,90 @@ def score(x,sim,n):
     if np.isfinite(z.MA5) and np.isfinite(z.MA10) and np.isfinite(z.MA20):
         t += 7 if z.MA5>=z.MA10>=z.MA20 else (-5 if z.MA5<=z.MA10<=z.MA20 else 0)
 
-    # 支撑距离：MA/近期低点越接近，当日下影越有解释力
+    # 支撑 / 压力距离，统一用 ATR 标准化
     supports=[q for q in [z.MA5,z.MA10,z.MA20,z.MA30,z.MA60,z.LOW20] if np.isfinite(q) and q>0]
+    resistances=[q for q in [z.MA5,z.MA10,z.MA20,z.MA30,z.MA60,z.HIGH20,z.HIGH60] if np.isfinite(q) and q>0]
     support_dist=min([abs(l-q)/atr for q in supports],default=9.0)
+    resistance_dist=min([abs(h-q)/atr for q in resistances],default=9.0)
     near_support=support_dist<=0.55
+    near_resistance=resistance_dist<=0.55
 
-    # V5.5 承接强弱：不是看到长下影就叫“承接”
+    # 当前价格在20/60日区间的位置，用于识别高位派发 vs 低位试盘
+    low20=float(z.LOW20) if np.isfinite(z.LOW20) else l
+    high20=float(z.HIGH20) if np.isfinite(z.HIGH20) else h
+    pos20=float((c-low20)/max(high20-low20,1e-8))
+    low60=float(z.LOW60) if np.isfinite(z.LOW60) else low20
+    high60=float(z.HIGH60) if np.isfinite(z.HIGH60) else high20
+    pos60=float((c-low60)/max(high60-low60,1e-8))
+
+    # -------- 下影承接 0-100 --------
     wick_score=0.0
     if lower>=.30:
         wick_score += np.clip((lower-.30)/.40*35,0,35)
         wick_score += np.clip((close_pos-.55)/.35*25,0,25)
         wick_score += 18 if near_support else 0
-        # 量能：温和放量/正常量更可信；巨量杀跌扣分
         if .75<=vr<=1.8: wick_score += 12
         elif vr<.45: wick_score -= 5
         elif vr>2.2 and ret<0: wick_score -= 18
-        # 收盘重新站回开盘/前收附近
         if c>=o: wick_score += 7
-        if c>=float(p["收盘"])*.995: wick_score += 5
+        if c>=pc*.995: wick_score += 5
     wick_score=float(np.clip(wick_score,0,100))
+    if lower<.30: wick_label="无明显长下影"
+    elif wick_score>=75: wick_label="强承接"
+    elif wick_score>=55: wick_label="疑似承接"
+    else: wick_label="仅长下影，承接未确认"
 
-    if lower<.30:
-        wick_label="无明显长下影"
-    elif wick_score>=75:
-        wick_label="强承接"
-    elif wick_score>=55:
-        wick_label="疑似承接"
+    # -------- 上影抛压 0-100 --------
+    pressure=0.0
+    if upper>=.25:
+        # 上影本身
+        pressure += np.clip((upper-.25)/.45*32,0,32)
+        # 收盘越靠近全天低位，冲高回落越明显
+        pressure += np.clip((.55-close_pos)/.40*24,0,24)
+        # 正好打到技术压力
+        pressure += 17 if near_resistance else 0
+        # 放量长上影比缩量上影更值得警惕
+        if 1.20<=vr<=2.20: pressure += np.clip((vr-1.2)/1.0*12+5,5,17)
+        elif vr>2.20: pressure += 20
+        elif vr<.65: pressure -= 5
+        # 高位长上影更偏向兑现/派发风险
+        if pos20>=.78: pressure += 10
+        if pos60>=.82: pressure += 6
+        # 阴线/跌回前收增强抛压
+        if c<o: pressure += 6
+        if c<pc*.995: pressure += 6
+
+    # 低位试盘修正：低位出现上影，不能机械判为派发
+    probe=False
+    if upper>=.35 and pos20<=.35 and pos60<=.45 and c>=float(z.MA5)*.985:
+        probe=True
+        pressure -= 18
+        if vr>=1.05: pressure -= 5
+
+    pressure=float(np.clip(pressure,0,100))
+    if upper<.25:
+        pressure_label="无明显长上影"
+    elif probe and pressure<65:
+        pressure_label="低位试盘可能"
+    elif pressure>=85:
+        pressure_label="高位派发风险"
+    elif pressure>=70:
+        pressure_label="强抛压"
+    elif pressure>=50:
+        pressure_label="疑似抛压"
     else:
-        wick_label="仅长下影，承接未确认"
+        pressure_label="普通上影，抛压未确认"
 
-    # 量价评分改为连续评分
+    # 量价评分：双向净强度 + 量能关系 + 收盘位置
     s=50.0
-    # 上涨配合放量、回落配合缩量加分；反过来扣分
     if ret>0:
         s += np.clip((vr-1.0)*16,-10,16)
     elif ret<0:
         s += np.clip((1.0-vr)*15,-18,12)
-    s += (wick_score-50)*.22
-    s -= np.clip((upper-.35)*30,0,12)
-    # 收盘位置越高越好
-    s += np.clip((close_pos-.5)*16,-8,8)
+    s += (wick_score-50)*.20
+    s -= (pressure-35)*.23
+    s += np.clip((close_pos-.5)*14,-7,7)
+    s=float(np.clip(s,0,100))
 
     sig=[]
     if ret<0 and vr<.75:
@@ -306,13 +351,16 @@ def score(x,sim,n):
     else:
         sig.append(f"• 量能中性：20日量比 {vr:.2f}×")
 
-    sig.append(f"• 下影占振幅 {lower*100:.0f}% ｜ 收盘位置 {close_pos*100:.0f}% ｜ {wick_label}（{wick_score:.0f}/100）")
+    sig.append(f"• 下影 {lower*100:.0f}% ｜ 承接 {wick_score:.0f}/100 ｜ {wick_label}")
+    sig.append(f"• 上影 {upper*100:.0f}% ｜ 抛压 {pressure:.0f}/100 ｜ {pressure_label}")
     if near_support:
-        sig.append(f"• 当日低点距最近技术支撑约 {support_dist:.2f} ATR")
-    else:
-        sig.append("• 下影未发生在足够接近的技术支撑区域")
-    if upper>.45:
-        sig.append(f"⚠ 上影较长：占振幅 {upper*100:.0f}%")
+        sig.append(f"• 低点距最近技术支撑约 {support_dist:.2f} ATR")
+    if near_resistance:
+        sig.append(f"• 高点距最近技术压力约 {resistance_dist:.2f} ATR")
+    if probe:
+        sig.append("• 当前处于相对低位，上影已按“试盘可能”降低派发权重")
+    elif pressure>=70:
+        sig.append("⚠ 冲高回落与位置/量能共同指向较强抛压，需观察下一交易日确认")
 
     hs=50 if not sim else int(np.clip(
         50+(sim["win"]-.5)*90+np.clip(sim["avg"]/.025,-1.5,1.5)*22+(sim["p55"]-.30)*18,0,100))
@@ -327,11 +375,15 @@ def score(x,sim,n):
 
     detail={
         "vr20":vr,"ret":ret,"lower":lower,"upper":upper,
-        "close_pos":close_pos,"body":body,"wick_score":wick_score,
-        "wick_label":wick_label,"support_dist":support_dist,
-        "near_support":near_support
+        "close_pos":close_pos,"body":body,
+        "wick_score":wick_score,"wick_label":wick_label,
+        "pressure_score":pressure,"pressure_label":pressure_label,
+        "support_dist":support_dist,"resistance_dist":resistance_dist,
+        "near_support":near_support,"near_resistance":near_resistance,
+        "pos20":pos20,"pos60":pos60,"probe":probe,
+        "net_strength":wick_score-pressure
     }
-    return int(np.clip(t,0,100)),int(np.clip(s,0,100)),hs,int(np.clip(ns,0,100)),sev,sig,detail
+    return int(np.clip(t,0,100)),int(s),hs,int(np.clip(ns,0,100)),sev,sig,detail
 
 def trend_stage(x):
     z=x.iloc[-1]; p=x.iloc[-2]
@@ -409,8 +461,8 @@ def levels(x):
     t2=max(r2,c+2.4*a)
     return s1,s2,r1,r2,lo,hi,b1,b2,sl,t1,t2,pull
 
-st.title("📈 A股短线模型 V5.6")
-st.caption("趋势阶段识别 · 条件透明化 · 两级突破 · 量价真实性 · 交易期望")
+st.title("📈 A股短线模型 V5.7")
+st.caption("承接+抛压双向评分 · 上影技术形态 · 趋势阶段 · 历史形态 · 交易期望")
 code=st.text_input("输入6位A股代码",placeholder="例如：002159",max_chars=6)
 capital=st.number_input("模拟投入金额（元）",min_value=1000.0,max_value=10000000.0,value=10000.0,step=1000.0)
 
@@ -527,11 +579,41 @@ if st.button("开始分析",type="primary",use_container_width=True):
                 st.write("### 量价 / K线真实性")
                 a,b,c=st.columns(3)
                 a.metric("20日量比",f"{qd['vr20']:.2f}×")
-                b.metric("下影占比",f"{qd['lower']*100:.0f}%")
-                c.metric("承接强度",f"{qd['wick_score']:.0f}/100")
-                st.write(f"**承接判断：{qd['wick_label']}**")
-                for q in sigs:st.write(q)
-                st.caption("“长下影”只描述K线形状；只有同时满足收盘位置、支撑距离和量能等条件，模型才升级为“疑似承接/强承接”。")
+                b.metric("承接强度",f"{qd['wick_score']:.0f}/100")
+                c.metric("抛压强度",f"{qd['pressure_score']:.0f}/100")
+
+                a,b=st.columns(2)
+                with a:
+                    st.write("**下影 / 承接**")
+                    st.write(f"下影占比 **{qd['lower']*100:.0f}%**")
+                    st.write(f"判断：**{qd['wick_label']}**")
+                    if qd["near_support"]:
+                        st.write(f"距技术支撑 **{qd['support_dist']:.2f} ATR**")
+                with b:
+                    st.write("**上影 / 抛压**")
+                    st.write(f"上影占比 **{qd['upper']*100:.0f}%**")
+                    st.write(f"判断：**{qd['pressure_label']}**")
+                    if qd["near_resistance"]:
+                        st.write(f"距技术压力 **{qd['resistance_dist']:.2f} ATR**")
+
+                net=qd["net_strength"]
+                if net>=30:
+                    net_label="🟢 承接明显强于抛压"
+                elif net<=-30:
+                    net_label="🔴 抛压明显强于承接"
+                else:
+                    net_label="🟡 承接与抛压暂未形成明显优势"
+                st.write(f"**净量价强度：{net:+.0f} → {net_label}**")
+                st.write(f"20日区间位置 **{qd['pos20']*100:.0f}%** ｜ 60日区间位置 **{qd['pos60']*100:.0f}%** ｜ 收盘位置 **{qd['close_pos']*100:.0f}%**")
+
+                for q in sigs: st.write(q)
+
+                if qd["pressure_score"]>=70:
+                    st.warning("上影抛压较强：如果下一交易日跌破该K线低点或继续放量下跌，可视为抛压进一步确认；若快速收复上影区域，则本次抛压信号减弱。")
+                elif qd["probe"]:
+                    st.info("该上影位于相对低位，模型识别为“试盘可能”。需要后续放量突破上影高点才能确认转强，不能仅凭上影判断出货。")
+
+                st.caption("承接与抛压均为0–100技术强度评分，不等同于主力资金身份判断。长上/下影只是形态，只有结合位置、支撑/压力、量能和收盘结构才升级为有效信号。")
                 st.write("### 交易期望 / 是否值得参与")
                 if not sim:
                     st.warning("相似样本不足，暂不计算投资期望。")
@@ -593,5 +675,5 @@ if st.button("开始分析",type="primary",use_container_width=True):
                     tc=next((q for q in n.columns if "标题" in str(q) or str(q).lower()=="title"),n.columns[0])
                     for t in n[tc].head(8):st.write("• "+str(t))
                 st.line_chart(x.tail(80).set_index("日期")[["收盘","MA5","MA10","MA20","MA30","MA60"]])
-                st.warning("V5.6使用公开行情接口，不是券商交易接口。实时数据和换手率估算可能存在延迟/口径差异；数据冲突时自动暂停信号。")
+                st.warning("V5.7使用公开行情接口，不是券商交易接口。实时数据和换手率估算可能存在延迟/口径差异；数据冲突时自动暂停信号。")
             except Exception as e:st.error("计算异常："+str(e))
