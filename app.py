@@ -3,7 +3,7 @@ import pandas as pd, numpy as np, akshare as ak
 from datetime import datetime,timedelta
 import requests,time,random,re
 
-st.set_page_config(page_title="A股短线模型 V5.9",page_icon="📈",layout="centered")
+st.set_page_config(page_title="A股短线模型 V5.9.1",page_icon="📈",layout="centered")
 st.markdown("""<style>.block-container{padding-top:1rem;max-width:860px}.box{border:1px solid rgba(128,128,128,.25);border-radius:16px;padding:14px;margin:8px 0}.big{font-size:1.3rem;font-weight:700}[data-testid="stMetricValue"]{font-size:1.2rem}</style>""",unsafe_allow_html=True)
 POS=["中标","签订","合同","回购","增持","预增","扭亏","分红","重大项目","战略合作","获批","订单","业绩增长"]
 NEG=["减持","解禁","立案","调查","处罚","诉讼","亏损","预亏","退市","风险提示","终止","违约","冻结","问询函"]
@@ -530,22 +530,65 @@ def score(x,sim,n):
     }
     return int(np.clip(t,0,100)),int(s),hs,int(np.clip(ns,0,100)),sev,sig,detail
 
-def dynamic_total(ts,ps,hs,ns,chip,sim,plan_ev,rr,news_available=True):
+def dynamic_total(ts,ps,hs,ns,chip,sim,plan_ev,rr,news_available=True,reli=None):
     """
-    V5.8 动态有效权重：
-    趋势25、量价20、筹码20、历史20、消息10、风险收益5。
-    缺失项不默认50拖分，而是从有效权重中剔除并重新归一化。
+    V5.9.1 权重体系：
+    真实行情/历史统计 80%：
+      量价30 + 趋势25 + 历史统计25
+    辅助信息 20%：
+      筹码8 + 消息7 + 风险收益5
+
+    缺失项从有效权重剔除后重新归一化。
+    历史项不再单纯重复奖励技术指标，而是结合
+    贝叶斯/Wilson/样本外稳定性修正历史分。
     """
     parts=[]
+
+    # 真实市场 55%
+    parts.append(("量价",float(ps),30))
     parts.append(("趋势",float(ts),25))
-    parts.append(("量价",float(ps),20))
-    if chip is not None:parts.append(("筹码",float(chip["score"]),20))
-    if sim is not None:parts.append(("历史",float(hs),20))
-    if news_available:parts.append(("消息",float(ns),10))
+
+    # 历史统计 25%：用V5.9真实性系统校正
+    if sim is not None:
+        hist=float(hs)
+        if reli is not None:
+            # 可信度决定我们多大程度相信历史分；低可信度向50收缩
+            trust=np.clip(reli["confidence"]/100,0,1)
+            hist=50+(hist-50)*trust
+
+            # 样本外是主要真实性校验，不直接制造高分
+            if reli["enough_oos"] and reli["test"] is not None:
+                oos=reli["test"]
+                oos_component=50
+                oos_component += np.clip((oos["win"]-.50)*70,-20,20)
+                oos_component += np.clip(oos["avg"]/.02*20,-20,20)
+                oos_component=float(np.clip(oos_component,0,100))
+                hist=.60*hist+.40*oos_component
+
+                # 样本外负期望时限制历史项，而不是靠其他指标掩盖
+                if oos["avg"]<=0:
+                    hist=min(hist,48)
+
+            # Wilson保守下限很低时，限制历史统计项
+            if reli["lo"]<.45:
+                hist=min(hist,52)
+
+        parts.append(("历史统计",float(np.clip(hist,0,100)),25))
+
+    # 辅助信息 20%
+    if chip is not None:
+        parts.append(("筹码估算",float(chip["score"]),8))
+
+    if news_available:
+        parts.append(("消息",float(ns),7))
+
     if np.isfinite(plan_ev) and np.isfinite(rr):
-        # 风险收益项只占5分，避免与历史胜率重复计分
-        rscore=50 + np.clip(plan_ev/.015*25,-30,30) + np.clip((rr-1.5)*12,-18,18)
+        # 交易机会只占5%，避免高盈亏比把差股票硬抬成高分
+        rscore=50
+        rscore += np.clip(plan_ev/.015*25,-30,30)
+        rscore += np.clip((rr-1.5)*12,-18,18)
         parts.append(("风险收益",float(np.clip(rscore,0,100)),5))
+
     denom=sum(w for _,_,w in parts)
     total=sum(s*w for _,s,w in parts)/denom if denom else 50
     return int(round(np.clip(total,0,100))),parts
@@ -626,8 +669,8 @@ def levels(x):
     t2=max(r2,c+2.4*a)
     return s1,s2,r1,r2,lo,hi,b1,b2,sl,t1,t2,pull
 
-st.title("📈 A股短线模型 V5.9")
-st.caption("胜率真实性系统 · 贝叶斯修正 · Wilson保守胜率 · 样本外验证 · 交易期望")
+st.title("📈 A股短线模型 V5.9.1")
+st.caption("80/20真实市场权重 · 胜率真实性 · 样本外验证 · 筹码辅助 · 交易期望")
 code=st.text_input("输入6位A股代码",placeholder="例如：002159",max_chars=6)
 capital=st.number_input("模拟投入金额（元）",min_value=1000.0,max_value=10000000.0,value=10000.0,step=1000.0)
 
@@ -697,7 +740,8 @@ if st.button("开始分析",type="primary",use_container_width=True):
 
                 total,score_parts=dynamic_total(
                     ts,ps,hs,ns,chip,sim,plan_ev,rr,
-                    news_available=(not n.empty)
+                    news_available=(not n.empty),
+                    reli=reli
                 )
                 # 风险闸门不是为了压分，而是避免严重风险被高分掩盖
                 if sev: total=min(total,55)
@@ -740,14 +784,15 @@ if st.button("开始分析",type="primary",use_container_width=True):
                 elif total>=60:grade="有条件参与"
                 elif total>=50:grade="观察"
                 else:grade="暂时回避"
-                st.write(f"**评分等级：{grade}**")
+                st.write(f"**股票质量等级：{grade}**")
+                st.caption("综合质量分用于判断股票当前结构质量，不等同于买入信号；是否参与仍由样本外表现、保守胜率、盈亏比、净交易期望和风险闸门共同决定。")
 
-                st.write("### 动态100分评分")
+                st.write("### 股票质量 / 动态100分评分")
                 cols=st.columns(min(3,len(score_parts)))
                 for i,(name,sc,w) in enumerate(score_parts):
                     cols[i%len(cols)].metric(name,f"{sc:.0f}/100",f"权重{w}")
                 eff=sum(w for _,_,w in score_parts)
-                st.caption(f"当前有效权重 {eff}/100；缺失的数据项不会被硬塞50分，而是从有效权重中剔除后重新归一化。")
+                st.caption(f"当前有效权重 {eff}/100。标准权重：量价30 + 趋势25 + 历史统计25 = 真实市场80%；筹码8 + 消息7 + 风险收益5 = 辅助20%。缺失项从有效权重中剔除后重新归一化。")
 
                 st.write("### 筹码成本 / 潜在兑现区")
                 if chip:
@@ -915,5 +960,5 @@ if st.button("开始分析",type="primary",use_container_width=True):
                     tc=next((q for q in n.columns if "标题" in str(q) or str(q).lower()=="title"),n.columns[0])
                     for t in n[tc].head(8):st.write("• "+str(t))
                 st.line_chart(x.tail(80).set_index("日期")[["收盘","MA5","MA10","MA20","MA30","MA60"]])
-                st.warning("V5.9使用公开行情接口，不是券商交易接口。实时数据和换手率估算可能存在延迟/口径差异；数据冲突时自动暂停信号。")
+                st.warning("V5.9.1使用公开行情接口，不是券商交易接口。实时数据和换手率估算可能存在延迟/口径差异；数据冲突时自动暂停信号。")
             except Exception as e:st.error("计算异常："+str(e))
