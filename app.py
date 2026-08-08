@@ -3,7 +3,7 @@ import pandas as pd, numpy as np, akshare as ak
 from datetime import datetime,timedelta
 import requests,time,random,re
 
-st.set_page_config(page_title="A股短线模型 V5.7",page_icon="📈",layout="centered")
+st.set_page_config(page_title="A股短线模型 V5.8",page_icon="📈",layout="centered")
 st.markdown("""<style>.block-container{padding-top:1rem;max-width:860px}.box{border:1px solid rgba(128,128,128,.25);border-radius:16px;padding:14px;margin:8px 0}.big{font-size:1.3rem;font-weight:700}[data-testid="stMetricValue"]{font-size:1.2rem}</style>""",unsafe_allow_html=True)
 POS=["中标","签订","合同","回购","增持","预增","扭亏","分红","重大项目","战略合作","获批","订单","业绩增长"]
 NEG=["减持","解禁","立案","调查","处罚","诉讼","亏损","预亏","退市","风险提示","终止","违约","冻结","问询函"]
@@ -234,6 +234,87 @@ def similar(x, lookback=15, max_samples=60, min_gap=12):
         "min_gap":min_gap
     }
 
+def chip_model(x, turn_hist_df=None, bins=55, days=120):
+    """
+    估算筹码成本分布，不宣称是真实账户持仓。
+    有每日换手率时：用换手衰减估算存量筹码；
+    无换手率时：退化为成交量加权成本分布。
+    """
+    w=x.tail(days).copy()
+    if len(w)<40:return None
+    prices=((w["最高"].astype(float)+w["最低"].astype(float)+w["收盘"].astype(float))/3).to_numpy()
+    vols=w["成交量"].astype(float).to_numpy()
+    dates=pd.to_datetime(w["日期"]).dt.normalize()
+    turns=None; mode="成交量加权估算"; quality="中"
+    if turn_hist_df is not None and len(turn_hist_df):
+        tm=turn_hist_df.copy()
+        tm["日期"]=pd.to_datetime(tm["日期"]).dt.normalize()
+        mp=dict(zip(tm["日期"],pd.to_numeric(tm["换手率"],errors="coerce")))
+        arr=np.array([mp.get(d,np.nan) for d in dates],float)
+        if np.isfinite(arr).sum()>=min(30,len(w)*.6):
+            med=np.nanmedian(arr)
+            arr=np.where(np.isfinite(arr),arr,med)
+            turns=np.clip(arr/100,0,.35)
+            mode="换手衰减筹码估算";quality="较高"
+
+    lo=float(np.nanmin(w["最低"]));hi=float(np.nanmax(w["最高"]))
+    if not np.isfinite(lo+hi) or hi<=lo:return None
+    edges=np.linspace(lo,hi,bins+1);centers=(edges[:-1]+edges[1:])/2
+    mass=np.zeros(bins,float)
+
+    if turns is not None:
+        # 每天换手意味着旧筹码按 (1-turnover) 衰减，新成交加入当日成本附近
+        for px,vol,to in zip(prices,vols,turns):
+            mass*=max(0,1-to)
+            idx=int(np.clip(np.searchsorted(edges,px)-1,0,bins-1))
+            mass[idx]+=max(to,1e-5)
+    else:
+        for px,vol in zip(prices,vols):
+            idx=int(np.clip(np.searchsorted(edges,px)-1,0,bins-1))
+            mass[idx]+=max(vol,0)
+
+    if mass.sum()<=0:return None
+    mass/=mass.sum()
+    peak=float(centers[np.argmax(mass)])
+    mean=float(np.sum(centers*mass))
+    cdf=np.cumsum(mass)
+    def quant(q):
+        return float(centers[min(np.searchsorted(cdf,q),len(centers)-1)])
+    c30,c15,c85,c95=quant(.30),quant(.15),quant(.85),quant(.95)
+    current=float(x.iloc[-1]["收盘"])
+    profit=float(mass[centers<current].sum())
+    concentration=float(mass[(centers>=c30)&(centers<=c85)].sum())
+
+    # 上方筹码压力：当前价上方约 0~12% 的筹码占比
+    overhead=float(mass[(centers>current)&(centers<=current*1.12)].sum())
+
+    # 潜在兑现区：上方筹码峰 + 技术压力融合
+    z=x.iloc[-1];atr=float(z.ATR) if np.isfinite(z.ATR) else current*.02
+    candidates=[q for q in [peak,c85,c95,z.MA20,z.MA30,z.MA60,z.HIGH20,z.HIGH60]
+                if np.isfinite(q) and q>current]
+    first=min(candidates) if candidates else current+1.5*atr
+    strong=max(first+0.6*atr, c85 if c85>current else first+1.2*atr)
+    zone1=(max(current,first-.25*atr),first+.25*atr)
+    zone2=(max(zone1[1],strong-.35*atr),strong+.45*atr)
+
+    # 筹码结构 0-100：不追求高分，只评估当前价相对成本与上方压力
+    sc=50.0
+    # 当前略高于主成本但不离谱通常较健康；过度远离成本扣分
+    rel=current/peak-1 if peak>0 else 0
+    if 0<=rel<=.08:sc+=14
+    elif -.04<=rel<0:sc+=7
+    elif rel>.15:sc-=12
+    elif rel<-.08:sc-=10
+    sc += np.clip((profit-.5)*22,-11,11)
+    sc -= np.clip(overhead/.35*18,0,18)
+    # 成本区越窄，筹码越集中；这里只给有限加分，避免重复
+    width=(c85-c30)/current if current>0 else .2
+    sc += np.clip((.12-width)/.12*8,-8,8)
+    return {"score":int(np.clip(sc,0,100)),"peak":peak,"mean":mean,
+            "c70lo":c15,"c70hi":c85,"c55lo":c30,"c55hi":c85,
+            "profit":profit,"overhead":overhead,"width":width,
+            "zone1":zone1,"zone2":zone2,"mode":mode,"quality":quality}
+
 def score(x,sim,n):
     z=x.iloc[-1];p=x.iloc[-2]
     c=float(z["收盘"]);o=float(z["开盘"]);h=float(z["最高"]);l=float(z["最低"])
@@ -385,6 +466,26 @@ def score(x,sim,n):
     }
     return int(np.clip(t,0,100)),int(s),hs,int(np.clip(ns,0,100)),sev,sig,detail
 
+def dynamic_total(ts,ps,hs,ns,chip,sim,plan_ev,rr,news_available=True):
+    """
+    V5.8 动态有效权重：
+    趋势25、量价20、筹码20、历史20、消息10、风险收益5。
+    缺失项不默认50拖分，而是从有效权重中剔除并重新归一化。
+    """
+    parts=[]
+    parts.append(("趋势",float(ts),25))
+    parts.append(("量价",float(ps),20))
+    if chip is not None:parts.append(("筹码",float(chip["score"]),20))
+    if sim is not None:parts.append(("历史",float(hs),20))
+    if news_available:parts.append(("消息",float(ns),10))
+    if np.isfinite(plan_ev) and np.isfinite(rr):
+        # 风险收益项只占5分，避免与历史胜率重复计分
+        rscore=50 + np.clip(plan_ev/.015*25,-30,30) + np.clip((rr-1.5)*12,-18,18)
+        parts.append(("风险收益",float(np.clip(rscore,0,100)),5))
+    denom=sum(w for _,_,w in parts)
+    total=sum(s*w for _,s,w in parts)/denom if denom else 50
+    return int(round(np.clip(total,0,100))),parts
+
 def trend_stage(x):
     z=x.iloc[-1]; p=x.iloc[-2]
     c=float(z["收盘"])
@@ -461,8 +562,8 @@ def levels(x):
     t2=max(r2,c+2.4*a)
     return s1,s2,r1,r2,lo,hi,b1,b2,sl,t1,t2,pull
 
-st.title("📈 A股短线模型 V5.7")
-st.caption("承接+抛压双向评分 · 上影技术形态 · 趋势阶段 · 历史形态 · 交易期望")
+st.title("📈 A股短线模型 V5.8")
+st.caption("筹码成本 · 潜在兑现区 · 动态100分评分 · 承接/抛压 · 历史形态 · 交易期望")
 code=st.text_input("输入6位A股代码",placeholder="例如：002159",max_chars=6)
 capital=st.number_input("模拟投入金额（元）",min_value=1000.0,max_value=10000000.0,value=10000.0,step=1000.0)
 
@@ -495,11 +596,10 @@ if st.button("开始分析",type="primary",use_container_width=True):
                         calc_turn=sinaq["volume"]/float_sh*100
                     except Exception:pass
 
-                n,nerr=get_news(code);sim=similar(x);ts,ps,hs,ns,sev,sigs,qd=score(x,sim,n)
-                total=round(ts*.25+ps*.25+hs*.30+ns*.20)
-                if sim and sim["avg"]<=0:total=min(total,64)
-                if sim and sim["win"]<.5:total=min(total,66)
-                if sev:total=min(total,50)
+                n,nerr=get_news(code)
+                sim=similar(x)
+                chip=chip_model(x,th)
+                ts,ps,hs,ns,sev,sigs,qd=score(x,sim,n)
                 s1,s2,r1,r2,lo,hi,b1,b2,sl,t1,t2,pull=levels(x)
                 stage,stage_desc,tchecks,td=trend_stage(x)
 
@@ -516,6 +616,13 @@ if st.button("开始分析",type="primary",use_container_width=True):
                 win_yuan=capital*plan_up
                 loss_yuan=capital*plan_down
                 hist_ev_yuan=capital*sim["avg"] if sim else np.nan
+
+                total,score_parts=dynamic_total(
+                    ts,ps,hs,ns,chip,sim,plan_ev,rr,
+                    news_available=(not n.empty)
+                )
+                # 风险闸门不是为了压分，而是避免严重风险被高分掩盖
+                if sev: total=min(total,55)
 
                 if conflict:act="🔴 双实时源冲突：暂停交易分析"
                 elif stale:act="⚠️ 历史行情明显滞后：暂停信号"
@@ -550,7 +657,34 @@ if st.button("开始分析",type="primary",use_container_width=True):
                     st.warning("换手率两个通道均不可用，本次不使用换手率参与判断。")
 
                 st.markdown(f'<div class="box"><div class="big">{act}</div>综合评分 {total}/100</div>',unsafe_allow_html=True)
-                a,b,c,d=st.columns(4);a.metric("趋势",ts);b.metric("量价",ps);c.metric("历史",hs);d.metric("消息",ns)
+                if total>=80:grade="强机会"
+                elif total>=70:grade="值得重点关注"
+                elif total>=60:grade="有条件参与"
+                elif total>=50:grade="观察"
+                else:grade="暂时回避"
+                st.write(f"**评分等级：{grade}**")
+
+                st.write("### 动态100分评分")
+                cols=st.columns(min(3,len(score_parts)))
+                for i,(name,sc,w) in enumerate(score_parts):
+                    cols[i%len(cols)].metric(name,f"{sc:.0f}/100",f"权重{w}")
+                eff=sum(w for _,_,w in score_parts)
+                st.caption(f"当前有效权重 {eff}/100；缺失的数据项不会被硬塞50分，而是从有效权重中剔除后重新归一化。")
+
+                st.write("### 筹码成本 / 潜在兑现区")
+                if chip:
+                    a,b,c=st.columns(3)
+                    a.metric("筹码结构",f"{chip['score']}/100")
+                    b.metric("主筹码峰",f"¥{chip['peak']:.2f}")
+                    c.metric("估算获利盘",f"{chip['profit']*100:.0f}%")
+                    st.write(f"估算平均成本 **¥{chip['mean']:.2f}** ｜ 70%成本区约 **¥{chip['c70lo']:.2f}–¥{chip['c70hi']:.2f}**")
+                    st.write(f"当前价上方12%范围内估算套牢/待解套筹码约 **{chip['overhead']*100:.0f}%**")
+                    st.write(f"第一潜在兑现压力区 **¥{chip['zone1'][0]:.2f}–¥{chip['zone1'][1]:.2f}**")
+                    st.write(f"强兑现风险参考区 **¥{chip['zone2'][0]:.2f}–¥{chip['zone2'][1]:.2f}**")
+                    st.caption(f"筹码模式：{chip['mode']}｜估算精度：{chip['quality']}。这是基于公开成交/换手数据的成本分布估算，不代表真实账户持仓，也不能确定主力会在某个价格出货。")
+                else:
+                    st.warning("筹码样本不足，本次不让筹码项参与总分。")
+
                 st.write("### 支撑 / 压力")
                 st.write(f"第一支撑 **¥{s1:.2f}** ｜ 第二支撑 **¥{s2:.2f}** ｜ 第一压力 **¥{r1:.2f}** ｜ 第二压力 **¥{r2:.2f}**")
                 st.write("### 趋势阶段")
@@ -630,7 +764,7 @@ if st.button("开始分析",type="primary",use_container_width=True):
                     elif plan_ev<=0:
                         invest="🔴 不值得做"
                         reason="按当前止盈/止损计算为负期望"
-                    elif plan_ev>=0.005 and rr>=1.5 and total>=68:
+                    elif plan_ev>=0.005 and rr>=1.5 and total>=70:
                         invest="🟢 值得考虑"
                         reason="期望值、盈亏比和综合评分同时通过"
                     else:
@@ -675,5 +809,5 @@ if st.button("开始分析",type="primary",use_container_width=True):
                     tc=next((q for q in n.columns if "标题" in str(q) or str(q).lower()=="title"),n.columns[0])
                     for t in n[tc].head(8):st.write("• "+str(t))
                 st.line_chart(x.tail(80).set_index("日期")[["收盘","MA5","MA10","MA20","MA30","MA60"]])
-                st.warning("V5.7使用公开行情接口，不是券商交易接口。实时数据和换手率估算可能存在延迟/口径差异；数据冲突时自动暂停信号。")
+                st.warning("V5.8使用公开行情接口，不是券商交易接口。实时数据和换手率估算可能存在延迟/口径差异；数据冲突时自动暂停信号。")
             except Exception as e:st.error("计算异常："+str(e))
