@@ -3,7 +3,7 @@ import pandas as pd, numpy as np, akshare as ak
 from datetime import datetime,timedelta
 import requests,time,random,re
 
-st.set_page_config(page_title="A股短线模型 V6.0",page_icon="📈",layout="centered")
+st.set_page_config(page_title="A股短线模型 V6.1",page_icon="📈",layout="centered")
 st.markdown("""<style>.block-container{padding-top:1rem;max-width:860px}.box{border:1px solid rgba(128,128,128,.25);border-radius:16px;padding:14px;margin:8px 0}.big{font-size:1.3rem;font-weight:700}[data-testid="stMetricValue"]{font-size:1.2rem}</style>""",unsafe_allow_html=True)
 POS=["中标","签订","合同","回购","增持","预增","扭亏","分红","重大项目","战略合作","获批","订单","业绩增长"]
 NEG=["减持","解禁","立案","调查","处罚","诉讼","亏损","预亏","退市","风险提示","终止","违约","冻结","问询函"]
@@ -653,6 +653,77 @@ def chip_pressure(chip):
     p+=np.clip((.10-width)/.10*10,-5,10)
     return int(np.clip(p,0,100))
 
+def trade_price_plan(x, opportunity, s1, s2, r1, r2, b1, b2, sl, t1, t2, pull, lo, hi):
+    """
+    V6.1 买卖价格计划。
+    输出区间而非假装存在唯一精确价格。
+    买入区综合支撑、ATR、回踩区和当前价；卖出区综合压力/目标位。
+    """
+    z=x.iloc[-1]
+    c=float(z["收盘"])
+    atr=float(z.ATR) if np.isfinite(z.ATR) and z.ATR>0 else max(c*.02, 0.01)
+
+    # 首选回踩买区；没有成熟回踩结构时，用支撑附近的窄区间作为“等待成交区”
+    if pull and np.isfinite(lo) and np.isfinite(hi):
+        buy_lo=max(0.01,float(lo))
+        buy_hi=max(buy_lo,float(hi))
+        buy_type="回踩候选买入区"
+    else:
+        anchor=float(s1) if np.isfinite(s1) and s1>0 else c
+        buy_lo=max(0.01, anchor-0.18*atr)
+        buy_hi=max(buy_lo, min(c+0.08*atr, anchor+0.22*atr))
+        buy_type="支撑附近观察买入区"
+
+    # 不建议为了追涨把买区无限抬到现价上方
+    if buy_lo > c*1.025:
+        buy_lo=max(0.01,c-0.15*atr)
+        buy_hi=c+0.08*atr
+        buy_type="当前价附近等待确认区"
+
+    # 第一卖出区优先使用真实上方压力；否则使用模型目标1
+    candidates=[v for v in [r1,t1,b1] if np.isfinite(v) and v>max(c,buy_hi)*1.002]
+    sell1=min(candidates) if candidates else max(float(t1), c+1.2*atr)
+    sell1_lo=max(c, sell1-0.12*atr)
+    sell1_hi=sell1+0.12*atr
+
+    # 第二卖出区：更高压力/目标2
+    candidates2=[v for v in [r2,t2,b2] if np.isfinite(v) and v>sell1_hi*1.003]
+    sell2=min(candidates2) if candidates2 else max(float(t2), sell1_hi+0.8*atr)
+    sell2_lo=max(sell1_hi, sell2-0.15*atr)
+    sell2_hi=sell2+0.15*atr
+
+    stop=float(sl)
+    if not np.isfinite(stop) or stop>=buy_lo:
+        stop=max(0.01, min(float(s2) if np.isfinite(s2) else buy_lo-atr, buy_lo-0.55*atr))
+
+    return {
+        "buy_lo":buy_lo,"buy_hi":buy_hi,"buy_type":buy_type,
+        "sell1_lo":sell1_lo,"sell1_hi":sell1_hi,
+        "sell2_lo":sell2_lo,"sell2_hi":sell2_hi,
+        "stop":stop
+    }
+
+def final_trade_summary(total, opportunity, confidence, reli, net_plan_ev, rr, sev, conflict, stale):
+    """首页一句话结论：值得做 / 等待 / 不做。"""
+    if conflict or stale:
+        return "⛔ 暂不做", "行情数据校验未通过，先不要依据模型交易。"
+    if sev:
+        return "⛔ 暂不做", "存在严重消息风险。"
+    if not reli or reli["n"]<35:
+        return "🟡 等待", "历史独立样本不足，胜率可信度不够。"
+    if reli["enough_oos"] and reli["test"] and reli["test"]["avg"]<=0:
+        return "🔴 不值得做", "样本外平均收益不为正。"
+    if np.isfinite(net_plan_ev) and net_plan_ev<=0:
+        return "🔴 不值得做", "扣除交易摩擦后统计期望为负。"
+    if (total>=65 and opportunity["score"]>=70 and confidence>=55
+        and np.isfinite(rr) and rr>=1.5
+        and np.isfinite(net_plan_ev) and net_plan_ev>=.004
+        and (not reli["enough_oos"] or reli["test"]["win"]>=.50)):
+        return "🟢 值得做候选", "质量、当前机会、可信度、盈亏比和净期望同时通过。"
+    if opportunity["score"]>=65 and confidence>=45:
+        return "🟡 值得观察", "位置开始有性价比，但交易条件尚未全部确认。"
+    return "⚪ 暂不做", "当前机会或统计优势不足，等待更好的价格/确认信号。"
+
 def dynamic_total(ts,ps,hs,ns,chip,sim,plan_ev,rr,news_available=True,reli=None):
     """
     V5.9.1 权重体系：
@@ -792,8 +863,8 @@ def levels(x):
     t2=max(r2,c+2.4*a)
     return s1,s2,r1,r2,lo,hi,b1,b2,sl,t1,t2,pull
 
-st.title("📈 A股短线模型 V6.0")
-st.caption("股票质量 · 当前价格机会 · 交易可信度 · 筹码压力 · 胜率真实性")
+st.title("📈 A股短线模型 V6.1")
+st.caption("一屏交易总结 · 建议买卖区间 · 股票质量 · 当前机会 · 交易可信度")
 code=st.text_input("输入6位A股代码",placeholder="例如：002159",max_chars=6)
 capital=st.number_input("模拟投入金额（元）",min_value=1000.0,max_value=10000000.0,value=10000.0,step=1000.0)
 
@@ -911,202 +982,261 @@ if st.button("开始分析",type="primary",use_container_width=True):
                 elif total>=60:grade="有条件参与"
                 elif total>=50:grade="观察"
                 else:grade="暂时回避"
-                st.write(f"**股票质量等级：{grade}**")
-                st.caption("综合质量分用于判断股票当前结构质量，不等同于买入信号。")
 
-                st.write("### 核心判断")
+                price_plan=trade_price_plan(x,opportunity,s1,s2,r1,r2,b1,b2,sl,t1,t2,pull,lo,hi)
+                final_label,final_reason=final_trade_summary(
+                    total,opportunity,confidence,reli,net_plan_ev,rr,sev,conflict,stale
+                )
+
+                # V6.1 首页只保留交易者最需要的信息
+                st.write("## 今日交易总结")
+                st.markdown(f'<div class="box"><div class="big">{final_label}</div>{final_reason}</div>',unsafe_allow_html=True)
                 a,b,c=st.columns(3)
                 a.metric("股票质量",f"{total}/100")
                 b.metric("当前机会",f"{opportunity['score']}/100")
                 c.metric("交易可信度",f"{confidence}/100")
-                st.write(f"**当前价格判断：{opportunity['label']}**")
-                if opportunity["reasons"]:
-                    st.write("**机会依据**")
-                    for q in opportunity["reasons"]: st.write(f"✓ {q}")
-                if opportunity["risks"]:
-                    st.write("**主要风险**")
-                    for q in opportunity["risks"]: st.write(f"⚠ {q}")
-                st.caption("“当前机会”重点判断现在这个价格是否有短线性价比；“股票质量”判断整体结构；“交易可信度”只表示历史统计与数据可靠程度。")
 
-                st.write("### 股票质量 / 动态100分评分")
-                cols=st.columns(min(3,len(score_parts)))
-                for i,(name,sc,w) in enumerate(score_parts):
-                    cols[i%len(cols)].metric(name,f"{sc:.0f}/100",f"权重{w}")
-                eff=sum(w for _,_,w in score_parts)
-                st.caption(f"当前有效权重 {eff}/100。标准权重：量价30 + 趋势25 + 历史统计25 = 真实市场80%；筹码8 + 消息7 + 风险收益5 = 辅助20%。缺失项从有效权重中剔除后重新归一化。")
-
-                st.write("### 筹码成本 / 上方压力 / 反弹空间")
-                if chip:
-                    a,b,c=st.columns(3)
-                    a.metric("上方筹码压力",f"{chip_press}/100" if chip_press is not None else "N/A")
-                    b.metric("主筹码峰",f"¥{chip['peak']:.2f}")
-                    c.metric("估算获利盘",f"{chip['profit']*100:.0f}%")
-                    st.write(f"估算平均成本 **¥{chip['mean']:.2f}** ｜ 70%成本区约 **¥{chip['c70lo']:.2f}–¥{chip['c70hi']:.2f}**")
-                    st.write(f"当前价上方12%范围内估算套牢/待解套筹码约 **{chip['overhead']*100:.0f}%**")
-                    current=float(x.iloc[-1]["收盘"])
-                    z1=chip["zone1"]; z2=chip["zone2"]
-                    if z1[1] > current:
-                        st.write(f"第一上方兑现/解套压力区 **¥{max(current,z1[0]):.2f}–¥{z1[1]:.2f}**")
-                    else:
-                        st.write("第一兑现区：**当前价下方的历史成本区已不作为上方压力显示**")
-                    if z2[1] > current:
-                        st.write(f"较强兑现/解套风险参考区 **¥{max(current,z2[0]):.2f}–¥{z2[1]:.2f}**")
-                    st.caption(f"筹码模式：{chip['mode']}｜估算精度：{chip['quality']}。这是基于公开成交/换手数据的成本分布估算，不代表真实账户持仓，也不能确定主力会在某个价格出货。")
+                if final_label.startswith("🟢") or final_label.startswith("🟡"):
+                    st.write(f"**建议买入：¥{price_plan['buy_lo']:.2f}–¥{price_plan['buy_hi']:.2f}**  · {price_plan['buy_type']}")
+                    st.write(f"**建议第一卖出：¥{price_plan['sell1_lo']:.2f}–¥{price_plan['sell1_hi']:.2f}**")
+                    st.write(f"第二卖出参考：¥{price_plan['sell2_lo']:.2f}–¥{price_plan['sell2_hi']:.2f} ｜ **止损/逻辑失效：¥{price_plan['stop']:.2f}**")
                 else:
-                    st.warning("筹码样本不足，本次不让筹码项参与总分。")
+                    st.write("**当前不生成主动买入价。** 先等待机会度/可信度改善。")
+                    st.write(f"若后续条件转强，支撑观察区约 ¥{price_plan['buy_lo']:.2f}–¥{price_plan['buy_hi']:.2f}。")
 
-                st.write("### 支撑 / 压力")
-                st.write(f"第一支撑 **¥{s1:.2f}** ｜ 第二支撑 **¥{s2:.2f}** ｜ 第一压力 **¥{r1:.2f}** ｜ 第二压力 **¥{r2:.2f}**")
-                st.write("### 趋势阶段")
-                st.markdown(f'<div class="box"><div class="big">{stage}</div>{stage_desc}</div>',unsafe_allow_html=True)
-                st.write(f"当前收盘 **¥{td['close']:.2f}** ｜ MA20 **¥{td['ma20']:.2f}** ｜ MA20近3日斜率 **{td['slope20']*100:+.2f}%**")
-                st.write(f"MA5短期斜率 **{td['slope5']*100:+.2f}%** ｜ RSI **{td['rsi']:.1f}**")
-                for name,ok in tchecks.items():
-                    st.write(("✅ " if ok else "❌ ")+name)
-                if not tchecks["收盘站上MA20"]:
-                    st.caption(f"距离重新站上MA20约 {(td['ma20']/td['close']-1)*100:.2f}%")
-                elif not tchecks["MA20走平/向上"]:
-                    st.caption("价格虽在MA20附近/上方，但MA20仍向下，暂不视为完整回踩结构。")
+                st.caption("买卖价是基于支撑、ATR、压力位、历史统计与当前结构生成的计划区间，不是保证成交或保证盈利的精确价位。")
 
-                st.write("### 买卖点")
-                if conflict or stale:
-                    st.write("**数据校验未通过，不生成有效交易建议。**")
-                elif pull:
-                    st.write(f"回踩候选 **¥{lo:.2f}–¥{hi:.2f}**")
-                elif stage.startswith("🟠") or stage.startswith("🟡"):
-                    st.write("当前属于止跌/筑底阶段，**不生成机械回踩买点**；等待趋势确认。")
-                else:
-                    st.write("趋势尚未满足回踩策略条件。")
-                st.write(f"第一压力突破观察 **¥{b1:.2f}** ｜ 结构突破确认 **¥{b2:.2f}**")
-                st.write(f"止损/无效参考 **¥{sl:.2f}** ｜ 目标1 **¥{t1:.2f}** ｜ 目标2 **¥{t2:.2f}**")
-                st.caption("第一压力突破=短线初步转强；结构突破=突破20日结构高点/更高压力，确认级别更高。")
-                st.write("### 量价 / K线真实性")
-                a,b,c=st.columns(3)
-                a.metric("20日量比",f"{qd['vr20']:.2f}×")
-                b.metric("承接强度",f"{qd['wick_score']:.0f}/100")
-                c.metric("抛压强度",f"{qd['pressure_score']:.0f}/100")
+                with st.expander("📌 为什么值得做 / 为什么不做"):
+                    st.write(f"**股票质量等级：{grade}**")
+                    st.write(f"**当前价格判断：{opportunity['label']}**")
+                    if opportunity["reasons"]:
+                        st.write("**机会依据**")
+                        for q in opportunity["reasons"]: st.write(f"✓ {q}")
+                    if opportunity["risks"]:
+                        st.write("**主要风险**")
+                        for q in opportunity["risks"]: st.write(f"⚠ {q}")
 
-                a,b=st.columns(2)
-                with a:
-                    st.write("**下影 / 承接**")
-                    st.write(f"下影占比 **{qd['lower']*100:.0f}%**")
-                    st.write(f"判断：**{qd['wick_label']}**")
-                    if qd["near_support"]:
-                        st.write(f"距技术支撑 **{qd['support_dist']:.2f} ATR**")
-                with b:
-                    st.write("**上影 / 抛压**")
-                    st.write(f"上影占比 **{qd['upper']*100:.0f}%**")
-                    st.write(f"判断：**{qd['pressure_label']}**")
-                    if qd["near_resistance"]:
-                        st.write(f"距技术压力 **{qd['resistance_dist']:.2f} ATR**")
-
-                net=qd["net_strength"]
-                if net>=30:
-                    net_label="🟢 承接明显强于抛压"
-                elif net<=-30:
-                    net_label="🔴 抛压明显强于承接"
-                else:
-                    net_label="🟡 承接与抛压暂未形成明显优势"
-                st.write(f"**净量价强度：{net:+.0f} → {net_label}**")
-                st.write(f"20日区间位置 **{qd['pos20']*100:.0f}%** ｜ 60日区间位置 **{qd['pos60']*100:.0f}%** ｜ 收盘位置 **{qd['close_pos']*100:.0f}%**")
-
-                for q in sigs: st.write(q)
-
-                if qd["pressure_score"]>=70:
-                    st.warning("上影抛压较强：如果下一交易日跌破该K线低点或继续放量下跌，可视为抛压进一步确认；若快速收复上影区域，则本次抛压信号减弱。")
-                elif qd["probe"]:
-                    st.info("该上影位于相对低位，模型识别为“试盘可能”。需要后续放量突破上影高点才能确认转强，不能仅凭上影判断出货。")
-
-                st.caption("承接与抛压均为0–100技术强度评分，不等同于主力资金身份判断。长上/下影只是形态，只有结合位置、支撑/压力、量能和收盘结构才升级为有效信号。")
-                st.write("### 胜率真实性")
-                if reli:
-                    a,b,c=st.columns(3)
-                    a.metric("原始胜率",f"{reli['raw']*100:.1f}%")
-                    b.metric("贝叶斯修正",f"{reli['bayes']*100:.1f}%")
-                    c.metric("保守胜率",f"{reli['conservative']*100:.1f}%")
-                    st.write(f"95% Wilson区间 **{reli['lo']*100:.1f}%–{reli['hi']*100:.1f}%** ｜ 独立案例 **{reli['n']}** ｜ 可信度 **{reli['confidence']:.0f}/100**")
-                    tr=reli["train"];te=reli["test"]
-                    if tr:
-                        st.write(f"早期70%样本：{tr['n']}次 ｜ 胜率 **{tr['win']*100:.1f}%** ｜ 平均5日 **{tr['avg']*100:+.2f}%**")
-                    if te:
-                        st.write(f"后期30%样本外：{te['n']}次 ｜ 胜率 **{te['win']*100:.1f}%** ｜ 平均5日 **{te['avg']*100:+.2f}%**")
-                        if te["n"]<12:
-                            st.warning("样本外案例不足12次，本次不把样本外胜率作为主要交易胜率。")
-                        elif tr and te["avg"]<=0:
-                            st.warning("样本外平均收益不为正：历史规律可能不稳定，需降低交易可信度。")
-                        elif tr and abs(tr["win"]-te["win"])>.15:
-                            st.warning("训练期与样本外胜率差异超过15个百分点，存在明显不稳定/过拟合风险。")
-                    st.caption("贝叶斯修正用于压低小样本虚高胜率；Wilson下限用于保守估计。样本外验证按历史时间顺序留出后30%案例，不使用未来数据反推该段结果。")
-                else:
-                    st.warning("独立相似案例不足，无法建立胜率真实性统计。")
-
-                st.write("### 交易期望 / 是否值得参与")
-                if not sim:
-                    st.warning("相似样本不足，暂不计算投资期望。")
-                elif conflict or stale:
-                    st.error("数据校验未通过，本次不输出“可投资”判断。")
-                else:
-                    # Gate: expectancy alone is not enough
-                    if sev:
-                        invest="⛔ 暂不参与"
-                        reason="存在严重消息风险"
-                    elif not reli or reli["n"]<35:
-                        invest="🟡 观察"
-                        reason="独立历史样本不足，胜率可信度有限"
-                    elif reli["enough_oos"] and reli["test"]["avg"]<=0:
-                        invest="🔴 不值得做"
-                        reason="样本外平均收益不为正"
-                    elif np.isfinite(net_plan_ev) and net_plan_ev<=0:
-                        invest="🔴 不值得做"
-                        reason="扣除交易摩擦后的计划期望为负"
-                    elif (np.isfinite(net_plan_ev) and net_plan_ev>=0.004 and rr>=1.5
-                          and total>=65 and opportunity["score"]>=70
-                          and reli["confidence"]>=55
-                          and (not reli["enough_oos"] or reli["test"]["win"]>=.50)):
-                        invest="🟢 值得考虑"
-                        reason="当前机会、股票质量、盈亏比、净期望和胜率可信度同时通过"
-                    else:
-                        invest="🟡 观察"
-                        reason="存在统计优势，但尚未同时通过全部交易门槛"
-                    st.markdown(f'<div class="box"><div class="big">{invest}</div>{reason}</div>',unsafe_allow_html=True)
-                    a,b,c=st.columns(3)
-                    a.metric("5日收涨概率",f"{wr*100:.1f}%")
-                    b.metric("计划盈亏比",f"{rr:.2f}:1" if np.isfinite(rr) else "—")
-                    c.metric("计划期望",f"{plan_ev*100:+.2f}%")
-                    st.write(f"模拟本金 **¥{capital:,.0f}** ｜ 计划入场参考 **¥{entry:.2f}**")
-                    st.write(f"若到目标 **¥{target:.2f}**：约 **+¥{win_yuan:,.0f}**（{plan_up*100:+.2f}%）")
-                    st.write(f"若触发止损 **¥{stop:.2f}**：约 **-¥{loss_yuan:,.0f}**（-{plan_down*100:.2f}%）")
-                    st.write(f"本次采用 **{wr_source} {wr*100:.1f}%** 计算交易计划。")
-                    st.write(f"毛统计期望约 **{expected_yuan:+,.0f} 元** ｜ 预留0.15%交易摩擦后约 **{net_expected_yuan:+,.0f} 元**")
-                    st.caption("计算逻辑：胜率×计划盈利幅度 − 败率×计划亏损幅度 − 交易摩擦。统计期望只描述大量同类交易的历史统计优势，不保证本次盈利。")
-                    st.write("**相似样本真实5日表现**")
-                    st.write(f"上涨样本平均 **{sim['avg_win']*100:+.2f}%** ｜ 下跌样本平均 **{sim['avg_loss']*100:.2f}%** ｜ 全样本平均 **{sim['avg']*100:+.2f}%**")
-                    st.write(f"25%分位 **{sim['q25']*100:+.2f}%** ｜ 中位数 **{sim['q50']*100:+.2f}%** ｜ 75%分位 **{sim['q75']*100:+.2f}%**")
-                    st.caption(f"若直接按历史5日平均收益折算，¥{capital:,.0f} 的统计期望约 {hist_ev_yuan:+,.0f} 元。未计佣金、滑点及实际成交偏差。")
-
-                st.write("### 历史K线形态相似")
-                if sim:
-                    st.write(f"比较最近 **{sim['lookback']}根K线**：价格路径、成交量路径、MA5/10/20结构、RSI/MACD变化、实体/上下影与波动率。")
-                    st.write(f"独立相似案例 **{sim['n']}次** ｜ 案例间至少间隔 **{sim['min_gap']}个交易日** ｜ 形态接近度参考 **{sim['similarity']:.1f}/100**")
-                    upn=round(sim["win"]*sim["n"]);downn=sim["n"]-upn
-                    a,b,c=st.columns(3)
-                    a.metric("5日上涨",f"{upn}/{sim['n']}")
-                    b.metric("5日上涨率",f"{sim['win']*100:.1f}%")
-                    c.metric("5日平均",f"{sim['avg']*100:+.2f}%")
-                    st.write(f"上涨案例平均 **{sim['avg_win']*100:+.2f}%** ｜ 下跌案例平均 **{sim['avg_loss']*100:.2f}%**")
-                    st.write(f"25%分位 **{sim['q25']*100:+.2f}%** ｜ 中位数 **{sim['q50']*100:+.2f}%** ｜ 75%分位 **{sim['q75']*100:+.2f}%**")
-                    st.write(f"3日摸到+3%：**{sim['p33']*100:.1f}%** ｜ 3日摸到+5%：**{sim['p35']*100:.1f}%** ｜ 5日摸到+5%：**{sim['p55']*100:.1f}%**")
-                    with st.expander("查看最相似的历史案例"):
+                with st.expander("📊 股票质量评分明细"):
+                    cols=st.columns(min(3,len(score_parts)))
+                    for i,(name,sc,w) in enumerate(score_parts):
+                        cols[i%len(cols)].metric(name,f"{sc:.0f}/100",f"权重{w}")
+                    eff=sum(w for _,_,w in score_parts)
+                    st.caption(f"有效权重 {eff}/100。标准：量价30 + 趋势25 + 历史统计25 = 真实市场80%；筹码8 + 消息7 + 风险收益5 = 辅助20%。")
+                st.write("## 详细分析")
+                tab_trend,tab_history,tab_chip,tab_volume,tab_expect,tab_news,tab_all=st.tabs(
+                    ["趋势","历史相似","筹码","量价/K线","胜率/期望","消息","全部详情"]
+                )
+                with tab_trend:
+                    st.write(f"**{stage}**")
+                    st.write(stage_desc)
+                    st.write(f"收盘 ¥{td['close']:.2f} ｜ MA20 ¥{td['ma20']:.2f} ｜ MA20斜率 {td['slope20']*100:+.2f}% ｜ RSI {td['rsi']:.1f}")
+                    st.write(f"支撑 ¥{s1:.2f}/¥{s2:.2f} ｜ 压力 ¥{r1:.2f}/¥{r2:.2f}")
+                with tab_history:
+                    if sim:
+                        st.write(f"独立相似案例 **{sim['n']}次** ｜ 5日上涨率 **{sim['win']*100:.1f}%** ｜ 平均5日 **{sim['avg']*100:+.2f}%**")
+                        st.write(f"形态接近度 **{sim['similarity']:.1f}/100**")
                         for q in sim["cases"]:
-                            st.write(f"{q['date'].date()} ｜ 5日收盘 {q['r5']*100:+.2f}% ｜ 5日最高 {q['r5max']*100:+.2f}% ｜ 最大回撤 {q['dd']*100:.2f}%")
-                    st.caption("形态接近度是模型内部距离的可读化指标，不代表上涨概率。历史案例仅用于统计研究。")
-                else:
-                    st.warning("独立历史形态样本不足，暂不输出历史胜率。")
-                st.write("### 最新公开消息")
-                if n.empty:st.warning("消息接口不可用，消息按中性50。")
-                else:
-                    tc=next((q for q in n.columns if "标题" in str(q) or str(q).lower()=="title"),n.columns[0])
-                    for t in n[tc].head(8):st.write("• "+str(t))
-                st.line_chart(x.tail(80).set_index("日期")[["收盘","MA5","MA10","MA20","MA30","MA60"]])
-                st.warning("V6.0使用公开行情接口，不是券商交易接口。实时数据和换手率估算可能存在延迟/口径差异；数据冲突时自动暂停信号。")
+                            st.write(f"{q['date'].date()} ｜ 5日 {q['r5']*100:+.2f}% ｜ 最高 {q['r5max']*100:+.2f}% ｜ 回撤 {q['dd']*100:.2f}%")
+                    else:
+                        st.warning("独立历史形态样本不足。")
+                with tab_chip:
+                    if chip:
+                        st.write(f"上方筹码压力 **{chip_press}/100** ｜ 主筹码峰 **¥{chip['peak']:.2f}** ｜ 平均成本 **¥{chip['mean']:.2f}**")
+                        st.write(f"70%成本区 **¥{chip['c70lo']:.2f}–¥{chip['c70hi']:.2f}** ｜ 近端套牢筹码约 **{chip['overhead']*100:.0f}%**")
+                        st.caption("筹码为公开成交/换手数据估算，不代表真实账户持仓。")
+                    else:
+                        st.warning("筹码样本不足。")
+                with tab_volume:
+                    st.write(f"20日量比 **{qd['vr20']:.2f}×** ｜ 承接 **{qd['wick_score']:.0f}/100** ｜ 抛压 **{qd['pressure_score']:.0f}/100**")
+                    st.write(f"下影占比 {qd['lower']*100:.0f}% ｜ 上影占比 {qd['upper']*100:.0f}% ｜ 净量价强度 {qd['net_strength']:+.0f}")
+                    for q in sigs: st.write(q)
+                with tab_expect:
+                    if reli:
+                        st.write(f"原始胜率 **{reli['raw']*100:.1f}%** ｜ 贝叶斯 **{reli['bayes']*100:.1f}%** ｜ 保守胜率 **{reli['conservative']*100:.1f}%**")
+                        st.write(f"95%区间 {reli['lo']*100:.1f}%–{reli['hi']*100:.1f}% ｜ 可信度 {reli['confidence']:.0f}/100")
+                    if sim:
+                        st.write(f"计划盈亏比 **{rr:.2f}:1** ｜ 毛期望 **{plan_ev*100:+.2f}%** ｜ 摩擦后期望 **{net_plan_ev*100:+.2f}%**")
+                        st.write(f"模拟本金 ¥{capital:,.0f} ｜ 毛统计期望约 {expected_yuan:+,.0f} 元 ｜ 摩擦后约 {net_expected_yuan:+,.0f} 元")
+                with tab_news:
+                    if n.empty:
+                        st.warning("消息接口不可用，本次消息按中性处理。")
+                    else:
+                        tc=next((q for q in n.columns if "标题" in str(q) or str(q).lower()=="title"),n.columns[0])
+                        for t in n[tc].head(8): st.write("• "+str(t))
+                with tab_all:
+                    st.write("### 筹码成本 / 上方压力 / 反弹空间")
+                    if chip:
+                        a,b,c=st.columns(3)
+                        a.metric("上方筹码压力",f"{chip_press}/100" if chip_press is not None else "N/A")
+                        b.metric("主筹码峰",f"¥{chip['peak']:.2f}")
+                        c.metric("估算获利盘",f"{chip['profit']*100:.0f}%")
+                        st.write(f"估算平均成本 **¥{chip['mean']:.2f}** ｜ 70%成本区约 **¥{chip['c70lo']:.2f}–¥{chip['c70hi']:.2f}**")
+                        st.write(f"当前价上方12%范围内估算套牢/待解套筹码约 **{chip['overhead']*100:.0f}%**")
+                        current=float(x.iloc[-1]["收盘"])
+                        z1=chip["zone1"]; z2=chip["zone2"]
+                        if z1[1] > current:
+                            st.write(f"第一上方兑现/解套压力区 **¥{max(current,z1[0]):.2f}–¥{z1[1]:.2f}**")
+                        else:
+                            st.write("第一兑现区：**当前价下方的历史成本区已不作为上方压力显示**")
+                        if z2[1] > current:
+                            st.write(f"较强兑现/解套风险参考区 **¥{max(current,z2[0]):.2f}–¥{z2[1]:.2f}**")
+                        st.caption(f"筹码模式：{chip['mode']}｜估算精度：{chip['quality']}。这是基于公开成交/换手数据的成本分布估算，不代表真实账户持仓，也不能确定主力会在某个价格出货。")
+                    else:
+                        st.warning("筹码样本不足，本次不让筹码项参与总分。")
+
+                    st.write("### 支撑 / 压力")
+                    st.write(f"第一支撑 **¥{s1:.2f}** ｜ 第二支撑 **¥{s2:.2f}** ｜ 第一压力 **¥{r1:.2f}** ｜ 第二压力 **¥{r2:.2f}**")
+                    st.write("### 趋势阶段")
+                    st.markdown(f'<div class="box"><div class="big">{stage}</div>{stage_desc}</div>',unsafe_allow_html=True)
+                    st.write(f"当前收盘 **¥{td['close']:.2f}** ｜ MA20 **¥{td['ma20']:.2f}** ｜ MA20近3日斜率 **{td['slope20']*100:+.2f}%**")
+                    st.write(f"MA5短期斜率 **{td['slope5']*100:+.2f}%** ｜ RSI **{td['rsi']:.1f}**")
+                    for name,ok in tchecks.items():
+                        st.write(("✅ " if ok else "❌ ")+name)
+                    if not tchecks["收盘站上MA20"]:
+                        st.caption(f"距离重新站上MA20约 {(td['ma20']/td['close']-1)*100:.2f}%")
+                    elif not tchecks["MA20走平/向上"]:
+                        st.caption("价格虽在MA20附近/上方，但MA20仍向下，暂不视为完整回踩结构。")
+
+                    st.write("### 买卖点")
+                    if conflict or stale:
+                        st.write("**数据校验未通过，不生成有效交易建议。**")
+                    elif pull:
+                        st.write(f"回踩候选 **¥{lo:.2f}–¥{hi:.2f}**")
+                    elif stage.startswith("🟠") or stage.startswith("🟡"):
+                        st.write("当前属于止跌/筑底阶段，**不生成机械回踩买点**；等待趋势确认。")
+                    else:
+                        st.write("趋势尚未满足回踩策略条件。")
+                    st.write(f"第一压力突破观察 **¥{b1:.2f}** ｜ 结构突破确认 **¥{b2:.2f}**")
+                    st.write(f"止损/无效参考 **¥{sl:.2f}** ｜ 目标1 **¥{t1:.2f}** ｜ 目标2 **¥{t2:.2f}**")
+                    st.caption("第一压力突破=短线初步转强；结构突破=突破20日结构高点/更高压力，确认级别更高。")
+                    st.write("### 量价 / K线真实性")
+                    a,b,c=st.columns(3)
+                    a.metric("20日量比",f"{qd['vr20']:.2f}×")
+                    b.metric("承接强度",f"{qd['wick_score']:.0f}/100")
+                    c.metric("抛压强度",f"{qd['pressure_score']:.0f}/100")
+
+                    a,b=st.columns(2)
+                    with a:
+                        st.write("**下影 / 承接**")
+                        st.write(f"下影占比 **{qd['lower']*100:.0f}%**")
+                        st.write(f"判断：**{qd['wick_label']}**")
+                        if qd["near_support"]:
+                            st.write(f"距技术支撑 **{qd['support_dist']:.2f} ATR**")
+                    with b:
+                        st.write("**上影 / 抛压**")
+                        st.write(f"上影占比 **{qd['upper']*100:.0f}%**")
+                        st.write(f"判断：**{qd['pressure_label']}**")
+                        if qd["near_resistance"]:
+                            st.write(f"距技术压力 **{qd['resistance_dist']:.2f} ATR**")
+
+                    net=qd["net_strength"]
+                    if net>=30:
+                        net_label="🟢 承接明显强于抛压"
+                    elif net<=-30:
+                        net_label="🔴 抛压明显强于承接"
+                    else:
+                        net_label="🟡 承接与抛压暂未形成明显优势"
+                    st.write(f"**净量价强度：{net:+.0f} → {net_label}**")
+                    st.write(f"20日区间位置 **{qd['pos20']*100:.0f}%** ｜ 60日区间位置 **{qd['pos60']*100:.0f}%** ｜ 收盘位置 **{qd['close_pos']*100:.0f}%**")
+
+                    for q in sigs: st.write(q)
+
+                    if qd["pressure_score"]>=70:
+                        st.warning("上影抛压较强：如果下一交易日跌破该K线低点或继续放量下跌，可视为抛压进一步确认；若快速收复上影区域，则本次抛压信号减弱。")
+                    elif qd["probe"]:
+                        st.info("该上影位于相对低位，模型识别为“试盘可能”。需要后续放量突破上影高点才能确认转强，不能仅凭上影判断出货。")
+
+                    st.caption("承接与抛压均为0–100技术强度评分，不等同于主力资金身份判断。长上/下影只是形态，只有结合位置、支撑/压力、量能和收盘结构才升级为有效信号。")
+                    st.write("### 胜率真实性")
+                    if reli:
+                        a,b,c=st.columns(3)
+                        a.metric("原始胜率",f"{reli['raw']*100:.1f}%")
+                        b.metric("贝叶斯修正",f"{reli['bayes']*100:.1f}%")
+                        c.metric("保守胜率",f"{reli['conservative']*100:.1f}%")
+                        st.write(f"95% Wilson区间 **{reli['lo']*100:.1f}%–{reli['hi']*100:.1f}%** ｜ 独立案例 **{reli['n']}** ｜ 可信度 **{reli['confidence']:.0f}/100**")
+                        tr=reli["train"];te=reli["test"]
+                        if tr:
+                            st.write(f"早期70%样本：{tr['n']}次 ｜ 胜率 **{tr['win']*100:.1f}%** ｜ 平均5日 **{tr['avg']*100:+.2f}%**")
+                        if te:
+                            st.write(f"后期30%样本外：{te['n']}次 ｜ 胜率 **{te['win']*100:.1f}%** ｜ 平均5日 **{te['avg']*100:+.2f}%**")
+                            if te["n"]<12:
+                                st.warning("样本外案例不足12次，本次不把样本外胜率作为主要交易胜率。")
+                            elif tr and te["avg"]<=0:
+                                st.warning("样本外平均收益不为正：历史规律可能不稳定，需降低交易可信度。")
+                            elif tr and abs(tr["win"]-te["win"])>.15:
+                                st.warning("训练期与样本外胜率差异超过15个百分点，存在明显不稳定/过拟合风险。")
+                        st.caption("贝叶斯修正用于压低小样本虚高胜率；Wilson下限用于保守估计。样本外验证按历史时间顺序留出后30%案例，不使用未来数据反推该段结果。")
+                    else:
+                        st.warning("独立相似案例不足，无法建立胜率真实性统计。")
+
+                    st.write("### 交易期望 / 是否值得参与")
+                    if not sim:
+                        st.warning("相似样本不足，暂不计算投资期望。")
+                    elif conflict or stale:
+                        st.error("数据校验未通过，本次不输出“可投资”判断。")
+                    else:
+                        # Gate: expectancy alone is not enough
+                        if sev:
+                            invest="⛔ 暂不参与"
+                            reason="存在严重消息风险"
+                        elif not reli or reli["n"]<35:
+                            invest="🟡 观察"
+                            reason="独立历史样本不足，胜率可信度有限"
+                        elif reli["enough_oos"] and reli["test"]["avg"]<=0:
+                            invest="🔴 不值得做"
+                            reason="样本外平均收益不为正"
+                        elif np.isfinite(net_plan_ev) and net_plan_ev<=0:
+                            invest="🔴 不值得做"
+                            reason="扣除交易摩擦后的计划期望为负"
+                        elif (np.isfinite(net_plan_ev) and net_plan_ev>=0.004 and rr>=1.5
+                              and total>=65 and opportunity["score"]>=70
+                              and reli["confidence"]>=55
+                              and (not reli["enough_oos"] or reli["test"]["win"]>=.50)):
+                            invest="🟢 值得考虑"
+                            reason="当前机会、股票质量、盈亏比、净期望和胜率可信度同时通过"
+                        else:
+                            invest="🟡 观察"
+                            reason="存在统计优势，但尚未同时通过全部交易门槛"
+                        st.markdown(f'<div class="box"><div class="big">{invest}</div>{reason}</div>',unsafe_allow_html=True)
+                        a,b,c=st.columns(3)
+                        a.metric("5日收涨概率",f"{wr*100:.1f}%")
+                        b.metric("计划盈亏比",f"{rr:.2f}:1" if np.isfinite(rr) else "—")
+                        c.metric("计划期望",f"{plan_ev*100:+.2f}%")
+                        st.write(f"模拟本金 **¥{capital:,.0f}** ｜ 计划入场参考 **¥{entry:.2f}**")
+                        st.write(f"若到目标 **¥{target:.2f}**：约 **+¥{win_yuan:,.0f}**（{plan_up*100:+.2f}%）")
+                        st.write(f"若触发止损 **¥{stop:.2f}**：约 **-¥{loss_yuan:,.0f}**（-{plan_down*100:.2f}%）")
+                        st.write(f"本次采用 **{wr_source} {wr*100:.1f}%** 计算交易计划。")
+                        st.write(f"毛统计期望约 **{expected_yuan:+,.0f} 元** ｜ 预留0.15%交易摩擦后约 **{net_expected_yuan:+,.0f} 元**")
+                        st.caption("计算逻辑：胜率×计划盈利幅度 − 败率×计划亏损幅度 − 交易摩擦。统计期望只描述大量同类交易的历史统计优势，不保证本次盈利。")
+                        st.write("**相似样本真实5日表现**")
+                        st.write(f"上涨样本平均 **{sim['avg_win']*100:+.2f}%** ｜ 下跌样本平均 **{sim['avg_loss']*100:.2f}%** ｜ 全样本平均 **{sim['avg']*100:+.2f}%**")
+                        st.write(f"25%分位 **{sim['q25']*100:+.2f}%** ｜ 中位数 **{sim['q50']*100:+.2f}%** ｜ 75%分位 **{sim['q75']*100:+.2f}%**")
+                        st.caption(f"若直接按历史5日平均收益折算，¥{capital:,.0f} 的统计期望约 {hist_ev_yuan:+,.0f} 元。未计佣金、滑点及实际成交偏差。")
+
+                    st.write("### 历史K线形态相似")
+                    if sim:
+                        st.write(f"比较最近 **{sim['lookback']}根K线**：价格路径、成交量路径、MA5/10/20结构、RSI/MACD变化、实体/上下影与波动率。")
+                        st.write(f"独立相似案例 **{sim['n']}次** ｜ 案例间至少间隔 **{sim['min_gap']}个交易日** ｜ 形态接近度参考 **{sim['similarity']:.1f}/100**")
+                        upn=round(sim["win"]*sim["n"]);downn=sim["n"]-upn
+                        a,b,c=st.columns(3)
+                        a.metric("5日上涨",f"{upn}/{sim['n']}")
+                        b.metric("5日上涨率",f"{sim['win']*100:.1f}%")
+                        c.metric("5日平均",f"{sim['avg']*100:+.2f}%")
+                        st.write(f"上涨案例平均 **{sim['avg_win']*100:+.2f}%** ｜ 下跌案例平均 **{sim['avg_loss']*100:.2f}%**")
+                        st.write(f"25%分位 **{sim['q25']*100:+.2f}%** ｜ 中位数 **{sim['q50']*100:+.2f}%** ｜ 75%分位 **{sim['q75']*100:+.2f}%**")
+                        st.write(f"3日摸到+3%：**{sim['p33']*100:.1f}%** ｜ 3日摸到+5%：**{sim['p35']*100:.1f}%** ｜ 5日摸到+5%：**{sim['p55']*100:.1f}%**")
+                        with st.expander("查看最相似的历史案例"):
+                            for q in sim["cases"]:
+                                st.write(f"{q['date'].date()} ｜ 5日收盘 {q['r5']*100:+.2f}% ｜ 5日最高 {q['r5max']*100:+.2f}% ｜ 最大回撤 {q['dd']*100:.2f}%")
+                        st.caption("形态接近度是模型内部距离的可读化指标，不代表上涨概率。历史案例仅用于统计研究。")
+                    else:
+                        st.warning("独立历史形态样本不足，暂不输出历史胜率。")
+                    st.write("### 最新公开消息")
+                    if n.empty:st.warning("消息接口不可用，消息按中性50。")
+                    else:
+                        tc=next((q for q in n.columns if "标题" in str(q) or str(q).lower()=="title"),n.columns[0])
+                        for t in n[tc].head(8):st.write("• "+str(t))
+                    st.line_chart(x.tail(80).set_index("日期")[["收盘","MA5","MA10","MA20","MA30","MA60"]])
+                    st.warning("V6.1使用公开行情接口，不是券商交易接口。实时数据和换手率估算可能存在延迟/口径差异；数据冲突时自动暂停信号。")
+
             except Exception as e:st.error("计算异常："+str(e))
