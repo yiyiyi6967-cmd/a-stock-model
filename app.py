@@ -3,7 +3,7 @@ import pandas as pd, numpy as np, akshare as ak
 from datetime import datetime,timedelta
 import requests,time,random,re
 
-st.set_page_config(page_title="A股短线模型 V5.9.1",page_icon="📈",layout="centered")
+st.set_page_config(page_title="A股短线模型 V6.0",page_icon="📈",layout="centered")
 st.markdown("""<style>.block-container{padding-top:1rem;max-width:860px}.box{border:1px solid rgba(128,128,128,.25);border-radius:16px;padding:14px;margin:8px 0}.big{font-size:1.3rem;font-weight:700}[data-testid="stMetricValue"]{font-size:1.2rem}</style>""",unsafe_allow_html=True)
 POS=["中标","签订","合同","回购","增持","预增","扭亏","分红","重大项目","战略合作","获批","订单","业绩增长"]
 NEG=["减持","解禁","立案","调查","处罚","诉讼","亏损","预亏","退市","风险提示","终止","违约","冻结","问询函"]
@@ -530,6 +530,129 @@ def score(x,sim,n):
     }
     return int(np.clip(t,0,100)),int(s),hs,int(np.clip(ns,0,100)),sev,sig,detail
 
+def current_opportunity(x, chip, qd, sim, reli, plan_ev, rr):
+    """
+    当前价格机会度 0-100：
+    与“股票质量”分离。重点回答现在这个价格是否有短线性价比。
+    不把“套牢盘多”机械等同于“不能买”。
+    """
+    z=x.iloc[-1]
+    c=float(z["收盘"])
+    atr=float(z.ATR) if np.isfinite(z.ATR) and z.ATR>0 else max(c*.02,1e-8)
+    score=50.0
+    reasons=[]
+    risks=[]
+
+    # 1) 支撑距离 / 承接 / 抛压
+    sd=float(qd.get("support_dist",9))
+    if sd<=.25:
+        score+=12; reasons.append(f"非常接近技术支撑（{sd:.2f} ATR）")
+    elif sd<=.55:
+        score+=7; reasons.append(f"接近技术支撑（{sd:.2f} ATR）")
+    elif sd>1.2:
+        score-=5; risks.append("距离明确技术支撑偏远")
+
+    wick=float(qd.get("wick_score",0))
+    pressure=float(qd.get("pressure_score",0))
+    score += np.clip((wick-45)*.12,-4,7)
+    score -= np.clip((pressure-45)*.14,-3,9)
+    if wick>=60: reasons.append(f"下影承接较强（{wick:.0f}/100）")
+    if pressure>=70: risks.append(f"上影抛压较强（{pressure:.0f}/100）")
+
+    # 2) 量能：缩量回踩加分，放量下跌扣分
+    vr=float(qd.get("vr20",1))
+    ret=float(qd.get("ret",0))
+    if ret<=0 and .45<=vr<=.85:
+        score+=9; reasons.append(f"缩量回落（20日量比 {vr:.2f}×）")
+    elif ret<0 and vr>=1.5:
+        score-=11; risks.append(f"放量下跌（20日量比 {vr:.2f}×）")
+    elif ret>0 and 1.15<=vr<=2.0:
+        score+=5; reasons.append("上涨伴随温和放量")
+
+    # 3) 成本位置：低于平均成本可以是反弹性价比，但必须受趋势约束
+    if chip:
+        mean=float(chip["mean"]); peak=float(chip["peak"])
+        discount=(c/mean-1) if mean>0 else 0
+        overhead=float(chip["overhead"])
+        if -.15<=discount<=-.05:
+            score+=8; reasons.append(f"当前价低于估算平均成本 {abs(discount)*100:.1f}%")
+        elif discount<-.15:
+            score+=3; risks.append("价格大幅低于估算成本，可能属于弱势下跌而非单纯便宜")
+        elif discount>.12:
+            score-=7; risks.append("当前价明显高于估算平均成本，追高性价比下降")
+
+        # 上方套牢盘是压力，不直接否决底部机会
+        if overhead>=.35:
+            score-=7; risks.append(f"上方近端筹码压力较大（约{overhead*100:.0f}%）")
+        elif overhead<=.15:
+            score+=4; reasons.append("近端上方筹码压力较轻")
+
+    # 4) 趋势状态：防止“便宜=机会”
+    slope=float(z.SLOPE20) if np.isfinite(z.SLOPE20) else 0
+    ma20=float(z.MA20) if np.isfinite(z.MA20) else c
+    ma5=float(z.MA5) if np.isfinite(z.MA5) else c
+    ma10=float(z.MA10) if np.isfinite(z.MA10) else c
+    if slope>0 and c>=ma20:
+        score+=9; reasons.append("MA20向上且价格位于MA20上方")
+    elif slope<-.008 and c<ma20:
+        score-=10; risks.append("MA20仍明显向下，反弹机会需防接飞刀")
+    elif slope>=-.003:
+        score+=4; reasons.append("MA20斜率接近走平")
+    if ma5>=ma10:
+        score+=4; reasons.append("短均线结构改善")
+
+    # 5) RSI位置
+    rsi=float(z.RSI) if np.isfinite(z.RSI) else 50
+    if 32<=rsi<=48:
+        score+=5; reasons.append(f"RSI {rsi:.0f}，处于偏低但非极端区域")
+    elif rsi<25:
+        score-=2; risks.append("RSI极低，需等待止跌确认")
+    elif rsi>72:
+        score-=7; risks.append("RSI偏高，短线追入风险增加")
+
+    # 6) 历史真实性 + 交易期望，只有限度参与机会分
+    if reli:
+        if reli["enough_oos"] and reli["test"]:
+            if reli["test"]["avg"]>0 and reli["test"]["win"]>=.5:
+                score+=7; reasons.append("样本外历史表现为正")
+            elif reli["test"]["avg"]<=0:
+                score-=8; risks.append("样本外平均收益不为正")
+        if reli["confidence"]<45:
+            score-=4; risks.append("历史统计可信度偏低")
+    if np.isfinite(plan_ev):
+        if plan_ev>.008: score+=5
+        elif plan_ev<=0: score-=7; risks.append("当前交易计划统计期望不为正")
+    if np.isfinite(rr):
+        if rr>=2: score+=5; reasons.append(f"计划盈亏比 {rr:.2f}")
+        elif rr<1.2: score-=7; risks.append(f"计划盈亏比仅 {rr:.2f}")
+
+    score=float(np.clip(score,0,100))
+    if score>=80: label="🟢 强机会候选"
+    elif score>=70: label="🟢 有机会，可等待/执行触发条件"
+    elif score>=60: label="🟡 有一定机会，适合观察"
+    elif score>=50: label="🟡 中性，等待更好价格或确认"
+    else: label="🔴 当前机会不足"
+    return {"score":int(round(score)),"label":label,
+            "reasons":reasons[:6],"risks":risks[:6]}
+
+def trading_confidence(reli, data_quality_ok=True):
+    """只回答统计/数据有多可信，不回答涨跌方向。"""
+    if not reli:return 30
+    c=float(reli["confidence"])
+    if reli["n"]<35:c-=10
+    if not reli["enough_oos"]:c-=8
+    if not data_quality_ok:c-=8
+    return int(np.clip(c,0,100))
+
+def chip_pressure(chip):
+    """0=上方压力轻，100=上方压力重。与机会度方向分离。"""
+    if not chip:return None
+    overhead=float(chip["overhead"])
+    width=float(chip["width"])
+    p=overhead/.40*70
+    p+=np.clip((.10-width)/.10*10,-5,10)
+    return int(np.clip(p,0,100))
+
 def dynamic_total(ts,ps,hs,ns,chip,sim,plan_ev,rr,news_available=True,reli=None):
     """
     V5.9.1 权重体系：
@@ -669,8 +792,8 @@ def levels(x):
     t2=max(r2,c+2.4*a)
     return s1,s2,r1,r2,lo,hi,b1,b2,sl,t1,t2,pull
 
-st.title("📈 A股短线模型 V5.9.1")
-st.caption("80/20真实市场权重 · 胜率真实性 · 样本外验证 · 筹码辅助 · 交易期望")
+st.title("📈 A股短线模型 V6.0")
+st.caption("股票质量 · 当前价格机会 · 交易可信度 · 筹码压力 · 胜率真实性")
 code=st.text_input("输入6位A股代码",placeholder="例如：002159",max_chars=6)
 capital=st.number_input("模拟投入金额（元）",min_value=1000.0,max_value=10000000.0,value=10000.0,step=1000.0)
 
@@ -738,6 +861,10 @@ if st.button("开始分析",type="primary",use_container_width=True):
                 net_plan_ev=(plan_ev-friction) if np.isfinite(plan_ev) else np.nan
                 net_expected_yuan=capital*net_plan_ev if np.isfinite(net_plan_ev) else np.nan
 
+                opportunity=current_opportunity(x,chip,qd,sim,reli,plan_ev,rr)
+                confidence=trading_confidence(reli, data_quality_ok=True)
+                chip_press=chip_pressure(chip)
+
                 total,score_parts=dynamic_total(
                     ts,ps,hs,ns,chip,sim,plan_ev,rr,
                     news_available=(not n.empty),
@@ -785,7 +912,21 @@ if st.button("开始分析",type="primary",use_container_width=True):
                 elif total>=50:grade="观察"
                 else:grade="暂时回避"
                 st.write(f"**股票质量等级：{grade}**")
-                st.caption("综合质量分用于判断股票当前结构质量，不等同于买入信号；是否参与仍由样本外表现、保守胜率、盈亏比、净交易期望和风险闸门共同决定。")
+                st.caption("综合质量分用于判断股票当前结构质量，不等同于买入信号。")
+
+                st.write("### 核心判断")
+                a,b,c=st.columns(3)
+                a.metric("股票质量",f"{total}/100")
+                b.metric("当前机会",f"{opportunity['score']}/100")
+                c.metric("交易可信度",f"{confidence}/100")
+                st.write(f"**当前价格判断：{opportunity['label']}**")
+                if opportunity["reasons"]:
+                    st.write("**机会依据**")
+                    for q in opportunity["reasons"]: st.write(f"✓ {q}")
+                if opportunity["risks"]:
+                    st.write("**主要风险**")
+                    for q in opportunity["risks"]: st.write(f"⚠ {q}")
+                st.caption("“当前机会”重点判断现在这个价格是否有短线性价比；“股票质量”判断整体结构；“交易可信度”只表示历史统计与数据可靠程度。")
 
                 st.write("### 股票质量 / 动态100分评分")
                 cols=st.columns(min(3,len(score_parts)))
@@ -794,16 +935,22 @@ if st.button("开始分析",type="primary",use_container_width=True):
                 eff=sum(w for _,_,w in score_parts)
                 st.caption(f"当前有效权重 {eff}/100。标准权重：量价30 + 趋势25 + 历史统计25 = 真实市场80%；筹码8 + 消息7 + 风险收益5 = 辅助20%。缺失项从有效权重中剔除后重新归一化。")
 
-                st.write("### 筹码成本 / 潜在兑现区")
+                st.write("### 筹码成本 / 上方压力 / 反弹空间")
                 if chip:
                     a,b,c=st.columns(3)
-                    a.metric("筹码结构",f"{chip['score']}/100")
+                    a.metric("上方筹码压力",f"{chip_press}/100" if chip_press is not None else "N/A")
                     b.metric("主筹码峰",f"¥{chip['peak']:.2f}")
                     c.metric("估算获利盘",f"{chip['profit']*100:.0f}%")
                     st.write(f"估算平均成本 **¥{chip['mean']:.2f}** ｜ 70%成本区约 **¥{chip['c70lo']:.2f}–¥{chip['c70hi']:.2f}**")
                     st.write(f"当前价上方12%范围内估算套牢/待解套筹码约 **{chip['overhead']*100:.0f}%**")
-                    st.write(f"第一潜在兑现压力区 **¥{chip['zone1'][0]:.2f}–¥{chip['zone1'][1]:.2f}**")
-                    st.write(f"强兑现风险参考区 **¥{chip['zone2'][0]:.2f}–¥{chip['zone2'][1]:.2f}**")
+                    current=float(x.iloc[-1]["收盘"])
+                    z1=chip["zone1"]; z2=chip["zone2"]
+                    if z1[1] > current:
+                        st.write(f"第一上方兑现/解套压力区 **¥{max(current,z1[0]):.2f}–¥{z1[1]:.2f}**")
+                    else:
+                        st.write("第一兑现区：**当前价下方的历史成本区已不作为上方压力显示**")
+                    if z2[1] > current:
+                        st.write(f"较强兑现/解套风险参考区 **¥{max(current,z2[0]):.2f}–¥{z2[1]:.2f}**")
                     st.caption(f"筹码模式：{chip['mode']}｜估算精度：{chip['quality']}。这是基于公开成交/换手数据的成本分布估算，不代表真实账户持仓，也不能确定主力会在某个价格出货。")
                 else:
                     st.warning("筹码样本不足，本次不让筹码项参与总分。")
@@ -913,10 +1060,11 @@ if st.button("开始分析",type="primary",use_container_width=True):
                         invest="🔴 不值得做"
                         reason="扣除交易摩擦后的计划期望为负"
                     elif (np.isfinite(net_plan_ev) and net_plan_ev>=0.004 and rr>=1.5
-                          and total>=70 and reli["confidence"]>=55
+                          and total>=65 and opportunity["score"]>=70
+                          and reli["confidence"]>=55
                           and (not reli["enough_oos"] or reli["test"]["win"]>=.50)):
                         invest="🟢 值得考虑"
-                        reason="质量、盈亏比、净期望和胜率可信度同时通过"
+                        reason="当前机会、股票质量、盈亏比、净期望和胜率可信度同时通过"
                     else:
                         invest="🟡 观察"
                         reason="存在统计优势，但尚未同时通过全部交易门槛"
@@ -960,5 +1108,5 @@ if st.button("开始分析",type="primary",use_container_width=True):
                     tc=next((q for q in n.columns if "标题" in str(q) or str(q).lower()=="title"),n.columns[0])
                     for t in n[tc].head(8):st.write("• "+str(t))
                 st.line_chart(x.tail(80).set_index("日期")[["收盘","MA5","MA10","MA20","MA30","MA60"]])
-                st.warning("V5.9.1使用公开行情接口，不是券商交易接口。实时数据和换手率估算可能存在延迟/口径差异；数据冲突时自动暂停信号。")
+                st.warning("V6.0使用公开行情接口，不是券商交易接口。实时数据和换手率估算可能存在延迟/口径差异；数据冲突时自动暂停信号。")
             except Exception as e:st.error("计算异常："+str(e))
