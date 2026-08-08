@@ -3,7 +3,7 @@ import pandas as pd, numpy as np, akshare as ak
 from datetime import datetime,timedelta
 import requests,time,random,re
 
-st.set_page_config(page_title="A股短线模型 V5.8",page_icon="📈",layout="centered")
+st.set_page_config(page_title="A股短线模型 V5.9",page_icon="📈",layout="centered")
 st.markdown("""<style>.block-container{padding-top:1rem;max-width:860px}.box{border:1px solid rgba(128,128,128,.25);border-radius:16px;padding:14px;margin:8px 0}.big{font-size:1.3rem;font-weight:700}[data-testid="stMetricValue"]{font-size:1.2rem}</style>""",unsafe_allow_html=True)
 POS=["中标","签订","合同","回购","增持","预增","扭亏","分红","重大项目","战略合作","获批","订单","业绩增长"]
 NEG=["减持","解禁","立案","调查","处罚","诉讼","亏损","预亏","退市","风险提示","终止","违约","冻结","问询函"]
@@ -230,9 +230,73 @@ def similar(x, lookback=15, max_samples=60, min_gap=12):
         "dd":float(np.mean([q["dd"] for q in rec])),
         "similarity":simscore,
         "cases":rec[:8],
+        "all_cases":rec,
         "lookback":lookback,
         "min_gap":min_gap
     }
+
+def wilson_interval(wins,n,z=1.96):
+    if n<=0:return (np.nan,np.nan)
+    p=wins/n
+    den=1+z*z/n
+    center=(p+z*z/(2*n))/den
+    half=z*np.sqrt(p*(1-p)/n+z*z/(4*n*n))/den
+    return max(0,center-half),min(1,center+half)
+
+def bayes_win_rate(wins,n,prior_strength=20,prior_mean=.50):
+    # 温和先验：等价于约20个50/50样本，防止小样本胜率虚高
+    a=prior_mean*prior_strength+wins
+    b=(1-prior_mean)*prior_strength+(n-wins)
+    return a/(a+b)
+
+def winrate_reliability(sim):
+    """
+    V5.9 胜率真实性：
+    1) 原始独立形态样本
+    2) Beta-Binomial 贝叶斯收缩
+    3) Wilson 95%置信区间/保守下限
+    4) 按时间顺序做早期70% / 后期30%样本外检查
+    注意：这是相似案例的时间留出检验，不是机器学习模型训练。
+    """
+    if not sim or not sim.get("all_cases"):return None
+    cases=sorted(sim["all_cases"],key=lambda q:q["date"])
+    n=len(cases)
+    wins=sum(q["r5"]>0 for q in cases)
+    raw=wins/n
+    bayes=bayes_win_rate(wins,n)
+    lo,hi=wilson_interval(wins,n)
+
+    cut=max(1,int(n*.70))
+    train=cases[:cut]
+    test=cases[cut:]
+    def stats(arr):
+        if not arr:return None
+        rr=np.array([q["r5"] for q in arr],float)
+        w=rr[rr>0];l=rr[rr<=0]
+        return {
+            "n":len(arr),"win":float((rr>0).mean()),
+            "avg":float(rr.mean()),
+            "avg_win":float(w.mean()) if len(w) else 0.0,
+            "avg_loss":float(l.mean()) if len(l) else 0.0
+        }
+    tr=stats(train);te=stats(test)
+
+    # 可信度不是收益评分：只评估样本量、区间宽度、样本外稳定性
+    width=hi-lo
+    conf=45.0
+    conf+=np.clip((n-25)/75*25,0,25)
+    conf+=np.clip((.35-width)/.25*20,-10,20)
+    if tr and te:
+        conf+=np.clip((.15-abs(tr["win"]-te["win"]))/.15*10,-10,10)
+    conf=float(np.clip(conf,0,100))
+
+    # 用样本外结果作为更严格的可交易统计；样本外太少则不强行给结论
+    enough_oos=bool(te and te["n"]>=12)
+    conservative=min(bayes,lo)  # 真正用于风控展示的保守胜率
+    return {"n":n,"wins":wins,"raw":raw,"bayes":bayes,"lo":lo,"hi":hi,
+            "conservative":conservative,"train":tr,"test":te,
+            "enough_oos":enough_oos,"confidence":conf}
+
 
 def chip_model(x, turn_hist_df=None, bins=55, days=120):
     """
@@ -562,8 +626,8 @@ def levels(x):
     t2=max(r2,c+2.4*a)
     return s1,s2,r1,r2,lo,hi,b1,b2,sl,t1,t2,pull
 
-st.title("📈 A股短线模型 V5.8")
-st.caption("筹码成本 · 潜在兑现区 · 动态100分评分 · 承接/抛压 · 历史形态 · 交易期望")
+st.title("📈 A股短线模型 V5.9")
+st.caption("胜率真实性系统 · 贝叶斯修正 · Wilson保守胜率 · 样本外验证 · 交易期望")
 code=st.text_input("输入6位A股代码",placeholder="例如：002159",max_chars=6)
 capital=st.number_input("模拟投入金额（元）",min_value=1000.0,max_value=10000000.0,value=10000.0,step=1000.0)
 
@@ -598,6 +662,7 @@ if st.button("开始分析",type="primary",use_container_width=True):
 
                 n,nerr=get_news(code)
                 sim=similar(x)
+                reli=winrate_reliability(sim)
                 chip=chip_model(x,th)
                 ts,ps,hs,ns,sev,sigs,qd=score(x,sim,n)
                 s1,s2,r1,r2,lo,hi,b1,b2,sl,t1,t2,pull=levels(x)
@@ -609,13 +674,26 @@ if st.button("开始分析",type="primary",use_container_width=True):
                 stop=sl
                 plan_up=max(target/entry-1,0.0) if entry>0 else 0.0
                 plan_down=max(1-stop/entry,0.0) if entry>0 else 0.0
-                wr=sim["win"] if sim else np.nan
-                plan_ev=(wr*plan_up-(1-wr)*plan_down) if sim else np.nan
+                # V5.9: 优先使用足量样本外胜率；否则使用保守胜率，不再直接用漂亮的原始胜率
+                if reli and reli["enough_oos"]:
+                    wr=float(reli["test"]["win"])
+                    wr_source="样本外胜率"
+                elif reli:
+                    wr=float(reli["conservative"])
+                    wr_source="保守胜率"
+                else:
+                    wr=np.nan
+                    wr_source="不可用"
+                plan_ev=(wr*plan_up-(1-wr)*plan_down) if np.isfinite(wr) else np.nan
                 rr=(plan_up/plan_down) if plan_down>0 else np.nan
                 expected_yuan=capital*plan_ev if np.isfinite(plan_ev) else np.nan
                 win_yuan=capital*plan_up
                 loss_yuan=capital*plan_down
                 hist_ev_yuan=capital*sim["avg"] if sim else np.nan
+                # 粗略交易摩擦预留：双边佣金/滑点等按0.15%估算，可后续做成用户参数
+                friction=0.0015
+                net_plan_ev=(plan_ev-friction) if np.isfinite(plan_ev) else np.nan
+                net_expected_yuan=capital*net_plan_ev if np.isfinite(net_plan_ev) else np.nan
 
                 total,score_parts=dynamic_total(
                     ts,ps,hs,ns,chip,sim,plan_ev,rr,
@@ -748,6 +826,28 @@ if st.button("开始分析",type="primary",use_container_width=True):
                     st.info("该上影位于相对低位，模型识别为“试盘可能”。需要后续放量突破上影高点才能确认转强，不能仅凭上影判断出货。")
 
                 st.caption("承接与抛压均为0–100技术强度评分，不等同于主力资金身份判断。长上/下影只是形态，只有结合位置、支撑/压力、量能和收盘结构才升级为有效信号。")
+                st.write("### 胜率真实性")
+                if reli:
+                    a,b,c=st.columns(3)
+                    a.metric("原始胜率",f"{reli['raw']*100:.1f}%")
+                    b.metric("贝叶斯修正",f"{reli['bayes']*100:.1f}%")
+                    c.metric("保守胜率",f"{reli['conservative']*100:.1f}%")
+                    st.write(f"95% Wilson区间 **{reli['lo']*100:.1f}%–{reli['hi']*100:.1f}%** ｜ 独立案例 **{reli['n']}** ｜ 可信度 **{reli['confidence']:.0f}/100**")
+                    tr=reli["train"];te=reli["test"]
+                    if tr:
+                        st.write(f"早期70%样本：{tr['n']}次 ｜ 胜率 **{tr['win']*100:.1f}%** ｜ 平均5日 **{tr['avg']*100:+.2f}%**")
+                    if te:
+                        st.write(f"后期30%样本外：{te['n']}次 ｜ 胜率 **{te['win']*100:.1f}%** ｜ 平均5日 **{te['avg']*100:+.2f}%**")
+                        if te["n"]<12:
+                            st.warning("样本外案例不足12次，本次不把样本外胜率作为主要交易胜率。")
+                        elif tr and te["avg"]<=0:
+                            st.warning("样本外平均收益不为正：历史规律可能不稳定，需降低交易可信度。")
+                        elif tr and abs(tr["win"]-te["win"])>.15:
+                            st.warning("训练期与样本外胜率差异超过15个百分点，存在明显不稳定/过拟合风险。")
+                    st.caption("贝叶斯修正用于压低小样本虚高胜率；Wilson下限用于保守估计。样本外验证按历史时间顺序留出后30%案例，不使用未来数据反推该段结果。")
+                else:
+                    st.warning("独立相似案例不足，无法建立胜率真实性统计。")
+
                 st.write("### 交易期望 / 是否值得参与")
                 if not sim:
                     st.warning("相似样本不足，暂不计算投资期望。")
@@ -758,18 +858,23 @@ if st.button("开始分析",type="primary",use_container_width=True):
                     if sev:
                         invest="⛔ 暂不参与"
                         reason="存在严重消息风险"
-                    elif sim["n"]<50:
+                    elif not reli or reli["n"]<35:
                         invest="🟡 观察"
-                        reason="历史相似样本不足50"
-                    elif plan_ev<=0:
+                        reason="独立历史样本不足，胜率可信度有限"
+                    elif reli["enough_oos"] and reli["test"]["avg"]<=0:
                         invest="🔴 不值得做"
-                        reason="按当前止盈/止损计算为负期望"
-                    elif plan_ev>=0.005 and rr>=1.5 and total>=70:
+                        reason="样本外平均收益不为正"
+                    elif np.isfinite(net_plan_ev) and net_plan_ev<=0:
+                        invest="🔴 不值得做"
+                        reason="扣除交易摩擦后的计划期望为负"
+                    elif (np.isfinite(net_plan_ev) and net_plan_ev>=0.004 and rr>=1.5
+                          and total>=70 and reli["confidence"]>=55
+                          and (not reli["enough_oos"] or reli["test"]["win"]>=.50)):
                         invest="🟢 值得考虑"
-                        reason="期望值、盈亏比和综合评分同时通过"
+                        reason="质量、盈亏比、净期望和胜率可信度同时通过"
                     else:
                         invest="🟡 观察"
-                        reason="正期望，但优势尚不足"
+                        reason="存在统计优势，但尚未同时通过全部交易门槛"
                     st.markdown(f'<div class="box"><div class="big">{invest}</div>{reason}</div>',unsafe_allow_html=True)
                     a,b,c=st.columns(3)
                     a.metric("5日收涨概率",f"{wr*100:.1f}%")
@@ -778,8 +883,9 @@ if st.button("开始分析",type="primary",use_container_width=True):
                     st.write(f"模拟本金 **¥{capital:,.0f}** ｜ 计划入场参考 **¥{entry:.2f}**")
                     st.write(f"若到目标 **¥{target:.2f}**：约 **+¥{win_yuan:,.0f}**（{plan_up*100:+.2f}%）")
                     st.write(f"若触发止损 **¥{stop:.2f}**：约 **-¥{loss_yuan:,.0f}**（-{plan_down*100:.2f}%）")
-                    st.write(f"按当前胜率与止盈/止损计算，单次统计期望约 **{expected_yuan:+,.0f} 元**。")
-                    st.caption("计算逻辑：胜率×计划盈利幅度 − 败率×计划亏损幅度。它是历史统计期望，不是未来收益保证。")
+                    st.write(f"本次采用 **{wr_source} {wr*100:.1f}%** 计算交易计划。")
+                    st.write(f"毛统计期望约 **{expected_yuan:+,.0f} 元** ｜ 预留0.15%交易摩擦后约 **{net_expected_yuan:+,.0f} 元**")
+                    st.caption("计算逻辑：胜率×计划盈利幅度 − 败率×计划亏损幅度 − 交易摩擦。统计期望只描述大量同类交易的历史统计优势，不保证本次盈利。")
                     st.write("**相似样本真实5日表现**")
                     st.write(f"上涨样本平均 **{sim['avg_win']*100:+.2f}%** ｜ 下跌样本平均 **{sim['avg_loss']*100:.2f}%** ｜ 全样本平均 **{sim['avg']*100:+.2f}%**")
                     st.write(f"25%分位 **{sim['q25']*100:+.2f}%** ｜ 中位数 **{sim['q50']*100:+.2f}%** ｜ 75%分位 **{sim['q75']*100:+.2f}%**")
@@ -809,5 +915,5 @@ if st.button("开始分析",type="primary",use_container_width=True):
                     tc=next((q for q in n.columns if "标题" in str(q) or str(q).lower()=="title"),n.columns[0])
                     for t in n[tc].head(8):st.write("• "+str(t))
                 st.line_chart(x.tail(80).set_index("日期")[["收盘","MA5","MA10","MA20","MA30","MA60"]])
-                st.warning("V5.8使用公开行情接口，不是券商交易接口。实时数据和换手率估算可能存在延迟/口径差异；数据冲突时自动暂停信号。")
+                st.warning("V5.9使用公开行情接口，不是券商交易接口。实时数据和换手率估算可能存在延迟/口径差异；数据冲突时自动暂停信号。")
             except Exception as e:st.error("计算异常："+str(e))
