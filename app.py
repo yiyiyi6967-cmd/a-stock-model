@@ -3,7 +3,7 @@ import pandas as pd, numpy as np, akshare as ak
 from datetime import datetime,timedelta
 import requests,time,random,re
 
-st.set_page_config(page_title="A股短线模型 V5.5",page_icon="📈",layout="centered")
+st.set_page_config(page_title="A股短线模型 V5.6",page_icon="📈",layout="centered")
 st.markdown("""<style>.block-container{padding-top:1rem;max-width:860px}.box{border:1px solid rgba(128,128,128,.25);border-radius:16px;padding:14px;margin:8px 0}.big{font-size:1.3rem;font-weight:700}[data-testid="stMetricValue"]{font-size:1.2rem}</style>""",unsafe_allow_html=True)
 POS=["中标","签订","合同","回购","增持","预增","扭亏","分红","重大项目","战略合作","获批","订单","业绩增长"]
 NEG=["减持","解禁","立案","调查","处罚","诉讼","亏损","预亏","退市","风险提示","终止","违约","冻结","问询函"]
@@ -333,19 +333,84 @@ def score(x,sim,n):
     }
     return int(np.clip(t,0,100)),int(np.clip(s,0,100)),hs,int(np.clip(ns,0,100)),sev,sig,detail
 
+def trend_stage(x):
+    z=x.iloc[-1]; p=x.iloc[-2]
+    c=float(z["收盘"])
+    ma5=float(z.MA5); ma10=float(z.MA10); ma20=float(z.MA20); ma30=float(z.MA30)
+    slope20=float(z.SLOPE20) if np.isfinite(z.SLOPE20) else 0.0
+    slope5=(ma5/float(x.iloc[-4].MA5)-1) if len(x)>=4 and np.isfinite(x.iloc[-4].MA5) and x.iloc[-4].MA5 else 0.0
+    rsi_v=float(z.RSI) if np.isfinite(z.RSI) else 50
+    mac=float(z.MACDH) if np.isfinite(z.MACDH) else 0
+    vr=float(z.VR20) if np.isfinite(z.VR20) else 1
+
+    checks = {
+        "收盘站上MA20": c >= ma20,
+        "MA20走平/向上": slope20 >= -0.001,
+        "MA5拐头向上": slope5 > 0,
+        "MA5站上MA10": ma5 >= ma10,
+        "MACD动能非负": mac >= 0,
+        "RSI站上50": rsi_v >= 50,
+    }
+    passed=sum(checks.values())
+
+    # 阶段识别：不把“未站上MA20”简单等同于纯下跌
+    if c < ma20 and slope20 < -0.006 and ma5 < ma10:
+        stage="🔴 下跌趋势"
+        desc="中期均线仍明显向下，优先防守。"
+    elif c < ma20 and (slope5 > 0 or mac > 0 or rsi_v >= 45):
+        stage="🟠 止跌观察"
+        desc="短线已有止跌迹象，但尚未重新站稳MA20。"
+    elif abs(c/ma20-1) <= .018 and slope20 >= -0.004 and passed >= 3:
+        stage="🟡 筑底/临界"
+        desc="价格围绕MA20整理，部分转强条件正在形成。"
+    elif c >= ma20 and slope20 >= -0.001 and passed >= 4:
+        stage="🟢 转强"
+        desc="已站上MA20，多项短线条件转好，但仍需突破压力确认。"
+    elif c >= ma20 and slope20 > .004 and ma5 >= ma10 >= ma20 and mac > 0:
+        stage="🔵 上升趋势"
+        desc="均线与动能形成较完整的上升结构。"
+    else:
+        stage="🟡 震荡/等待"
+        desc="多空条件混合，暂未形成清晰趋势。"
+
+    return stage, desc, checks, {
+        "close":c,"ma5":ma5,"ma10":ma10,"ma20":ma20,"ma30":ma30,
+        "slope20":slope20,"slope5":slope5,"rsi":rsi_v,"macd":mac,"vr20":vr,
+        "passed":passed
+    }
+
 def levels(x):
-    z=x.iloc[-1];c=float(z["收盘"]);a=max(float(z.ATR),c*.008);mas=[float(z[f"MA{n}"]) for n in [5,10,20,30,60]]
-    sp=sorted(set(q for q in mas+[float(z.LOW20),float(z.LOW60)] if np.isfinite(q) and q<c),reverse=True);rp=sorted(set(q for q in mas+[float(z.HIGH20),float(z.HIGH60)] if np.isfinite(q) and q>c))
-    s1=sp[0] if sp else c-a;s2=sp[1] if len(sp)>1 else s1-a;r1=rp[0] if rp else c+a;r2=rp[1] if len(rp)>1 else r1+a
+    z=x.iloc[-1];c=float(z["收盘"]);a=max(float(z.ATR),c*.008)
+    mas=[float(z[f"MA{n}"]) for n in [5,10,20,30,60]]
+    sp=sorted(set(q for q in mas+[float(z.LOW20),float(z.LOW60)] if np.isfinite(q) and q<c),reverse=True)
+    rp=sorted(set(q for q in mas+[float(z.HIGH20),float(z.HIGH60)] if np.isfinite(q) and q>c))
+    s1=sp[0] if sp else c-a
+    s2=sp[1] if len(sp)>1 else s1-a
+    r1=rp[0] if rp else c+a
+    r2=rp[1] if len(rp)>1 else r1+a
+
+    # 回踩条件保留，但趋势解释交给 trend_stage()
     pull=c>=z.MA20 and z.SLOPE20>=0
     if pull:
         center=max(s1,c-.65*a);lo=max(c-a,center-.2*a);hi=min(c+.08*a,center+.2*a)
         if lo>hi:lo,hi=hi,lo
-    else:lo=hi=np.nan
-    return s1,s2,r1,r2,lo,hi,max(r1,float(z.HIGH20)*.995),(s1-.8*a if pull else c-1.25*a),max(r1,c+1.5*a),max(r2,c+2.4*a),pull
+    else:
+        lo=hi=np.nan
 
-st.title("📈 A股短线模型 V5.5")
-st.caption("量价真实性升级 · 承接强弱分级 · 真实K线形态相似 · 交易期望")
+    # 两级突破：
+    # B1 = 最近的第一技术压力，适合观察“初步转强”
+    # B2 = 20日结构高点/第二压力，适合确认“结构突破”
+    b1=max(r1, c + .15*a)
+    structural=float(z.HIGH20) if np.isfinite(z.HIGH20) else r2
+    b2=max(r2, structural*.995, b1+.35*a)
+
+    sl=(s1-.8*a if pull else min(s1,c-1.10*a))
+    t1=max(r1,c+1.5*a)
+    t2=max(r2,c+2.4*a)
+    return s1,s2,r1,r2,lo,hi,b1,b2,sl,t1,t2,pull
+
+st.title("📈 A股短线模型 V5.6")
+st.caption("趋势阶段识别 · 条件透明化 · 两级突破 · 量价真实性 · 交易期望")
 code=st.text_input("输入6位A股代码",placeholder="例如：002159",max_chars=6)
 capital=st.number_input("模拟投入金额（元）",min_value=1000.0,max_value=10000000.0,value=10000.0,step=1000.0)
 
@@ -383,7 +448,8 @@ if st.button("开始分析",type="primary",use_container_width=True):
                 if sim and sim["avg"]<=0:total=min(total,64)
                 if sim and sim["win"]<.5:total=min(total,66)
                 if sev:total=min(total,50)
-                s1,s2,r1,r2,lo,hi,bo,sl,t1,t2,pull=levels(x)
+                s1,s2,r1,r2,lo,hi,b1,b2,sl,t1,t2,pull=levels(x)
+                stage,stage_desc,tchecks,td=trend_stage(x)
 
                 # V5.3 交易计划期望：用相似样本胜率 + 当前计划止盈/止损
                 entry=(lo+hi)/2 if pull and np.isfinite(lo) and np.isfinite(hi) else close
@@ -404,7 +470,8 @@ if st.button("开始分析",type="primary",use_container_width=True):
                 elif sev:act="🔴 消息风险：暂停买点"
                 elif close<z.MA20 or z.SLOPE20<0:act="🟡 趋势未确认：等待"
                 elif pull and lo<=close<=hi and total>=70:act="🟢 回踩候选"
-                elif close>=bo*.995 and z.VR20>=1.2 and total>=72:act="🟢 突破候选"
+                elif close>=b2*.995 and z.VR20>=1.2 and total>=72:act="🟢 结构突破候选"
+                elif close>=b1*.995 and total>=68:act="🟡 第一压力突破观察"
                 else:act="🟡 等待/观察"
 
                 st.write("### 数据可信度")
@@ -434,11 +501,29 @@ if st.button("开始分析",type="primary",use_container_width=True):
                 a,b,c,d=st.columns(4);a.metric("趋势",ts);b.metric("量价",ps);c.metric("历史",hs);d.metric("消息",ns)
                 st.write("### 支撑 / 压力")
                 st.write(f"第一支撑 **¥{s1:.2f}** ｜ 第二支撑 **¥{s2:.2f}** ｜ 第一压力 **¥{r1:.2f}** ｜ 第二压力 **¥{r2:.2f}**")
+                st.write("### 趋势阶段")
+                st.markdown(f'<div class="box"><div class="big">{stage}</div>{stage_desc}</div>',unsafe_allow_html=True)
+                st.write(f"当前收盘 **¥{td['close']:.2f}** ｜ MA20 **¥{td['ma20']:.2f}** ｜ MA20近3日斜率 **{td['slope20']*100:+.2f}%**")
+                st.write(f"MA5短期斜率 **{td['slope5']*100:+.2f}%** ｜ RSI **{td['rsi']:.1f}**")
+                for name,ok in tchecks.items():
+                    st.write(("✅ " if ok else "❌ ")+name)
+                if not tchecks["收盘站上MA20"]:
+                    st.caption(f"距离重新站上MA20约 {(td['ma20']/td['close']-1)*100:.2f}%")
+                elif not tchecks["MA20走平/向上"]:
+                    st.caption("价格虽在MA20附近/上方，但MA20仍向下，暂不视为完整回踩结构。")
+
                 st.write("### 买卖点")
-                if conflict or stale:st.write("**数据校验未通过，不生成有效交易建议。**")
-                elif pull:st.write(f"回踩候选 **¥{lo:.2f}–¥{hi:.2f}**")
-                else:st.write("趋势条件不足，不生成机械回踩买点。")
-                st.write(f"突破确认约 **¥{bo:.2f}** ｜ 止损/无效参考 **¥{sl:.2f}** ｜ 目标1 ¥{t1:.2f} ｜ 目标2 ¥{t2:.2f}")
+                if conflict or stale:
+                    st.write("**数据校验未通过，不生成有效交易建议。**")
+                elif pull:
+                    st.write(f"回踩候选 **¥{lo:.2f}–¥{hi:.2f}**")
+                elif stage.startswith("🟠") or stage.startswith("🟡"):
+                    st.write("当前属于止跌/筑底阶段，**不生成机械回踩买点**；等待趋势确认。")
+                else:
+                    st.write("趋势尚未满足回踩策略条件。")
+                st.write(f"第一压力突破观察 **¥{b1:.2f}** ｜ 结构突破确认 **¥{b2:.2f}**")
+                st.write(f"止损/无效参考 **¥{sl:.2f}** ｜ 目标1 **¥{t1:.2f}** ｜ 目标2 **¥{t2:.2f}**")
+                st.caption("第一压力突破=短线初步转强；结构突破=突破20日结构高点/更高压力，确认级别更高。")
                 st.write("### 量价 / K线真实性")
                 a,b,c=st.columns(3)
                 a.metric("20日量比",f"{qd['vr20']:.2f}×")
@@ -508,5 +593,5 @@ if st.button("开始分析",type="primary",use_container_width=True):
                     tc=next((q for q in n.columns if "标题" in str(q) or str(q).lower()=="title"),n.columns[0])
                     for t in n[tc].head(8):st.write("• "+str(t))
                 st.line_chart(x.tail(80).set_index("日期")[["收盘","MA5","MA10","MA20","MA30","MA60"]])
-                st.warning("V5.5使用公开行情接口，不是券商交易接口。实时数据和换手率估算可能存在延迟/口径差异；数据冲突时自动暂停信号。")
+                st.warning("V5.6使用公开行情接口，不是券商交易接口。实时数据和换手率估算可能存在延迟/口径差异；数据冲突时自动暂停信号。")
             except Exception as e:st.error("计算异常："+str(e))
