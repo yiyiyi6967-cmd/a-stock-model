@@ -3,7 +3,7 @@ import pandas as pd, numpy as np, akshare as ak
 from datetime import datetime,timedelta
 import requests,time,random,re
 
-st.set_page_config(page_title="A股短线模型 V6.3",page_icon="📈",layout="centered")
+st.set_page_config(page_title="A股短线模型 V6.3.1",page_icon="📈",layout="centered")
 st.markdown("""<style>.block-container{padding-top:1rem;max-width:860px}.box{border:1px solid rgba(128,128,128,.25);border-radius:16px;padding:14px;margin:8px 0}.big{font-size:1.3rem;font-weight:700}[data-testid="stMetricValue"]{font-size:1.2rem}</style>""",unsafe_allow_html=True)
 POS=["中标","签订","合同","回购","增持","预增","扭亏","分红","重大项目","战略合作","获批","订单","业绩增长"]
 NEG=["减持","解禁","立案","调查","处罚","诉讼","亏损","预亏","退市","风险提示","终止","违约","冻结","问询函"]
@@ -200,10 +200,12 @@ def similar(x, lookback=15, max_samples=60, min_gap=12):
         b=float(x.loc[j,"收盘"])
         f3=x.iloc[j+1:j+4];f5=x.iloc[j+1:j+6]
         if len(f5)<5 or b<=0:continue
+        r3=float(f3.iloc[-1]["收盘"]/b-1)
         r5=float(f5.iloc[-1]["收盘"]/b-1)
         rec.append({
             "idx":j,"dist":dist,
             "date":pd.Timestamp(x.loc[j,"日期"]),
+            "r3":r3,
             "r3max":float(f3["最高"].max()/b-1),
             "r5max":float(f5["最高"].max()/b-1),
             "r5":r5,
@@ -212,6 +214,7 @@ def similar(x, lookback=15, max_samples=60, min_gap=12):
     if len(rec)<20:return None
 
     rr=np.array([q["r5"] for q in rec],float)
+    r3=np.array([q["r3"] for q in rec],float)
     wins=rr[rr>0];losses=rr[rr<=0]
     dists=np.array([q["dist"] for q in rec],float)
     # 相似度只用于解释，不假装为严格概率：距离越小越接近100
@@ -707,7 +710,7 @@ def chip_pressure(chip):
 
 def trade_price_plan(x, opportunity, s1, s2, r1, r2, b1, b2, sl, t1, t2, pull, lo, hi):
     """
-    V6.3 买卖价格计划。
+    V6.3.1 买卖价格计划。
     输出区间而非假装存在唯一精确价格。
     买入区综合支撑、ATR、回踩区和当前价；卖出区综合压力/目标位。
     """
@@ -841,7 +844,7 @@ def dynamic_total(ts,ps,hs,ns,chip,sim,plan_ev,rr,news_available=True,reli=None)
 
 def trend_engine_v63(x):
     """
-    V6.3 趋势状态机。
+    V6.3.1 趋势状态机。
     不只判断均线多空，而是识别：
     上升趋势 / 上升回踩 / 再转强 / 下跌延续 / 下跌减速 / 底部转强 / 震荡。
     评分由四类证据构成：
@@ -1022,7 +1025,7 @@ def levels(x):
     t2=max(r2,c+2.4*a)
     return s1,s2,r1,r2,lo,hi,b1,b2,sl,t1,t2,pull
 
-st.title("📈 A股短线模型 V6.3")
+st.title("📈 A股短线模型 V6.3.1")
 st.caption("趋势状态机 · 趋势减速/拐点 · 5日完整路径 · 3日启动辅助 · TP/SL先后")
 code=st.text_input("输入6位A股代码",placeholder="例如：002159",max_chars=6)
 capital=st.number_input("模拟投入金额（元）",min_value=1000.0,max_value=10000000.0,value=10000.0,step=1000.0)
@@ -1062,7 +1065,7 @@ if st.button("开始分析",type="primary",use_container_width=True):
                 chip=chip_model(x,th)
                 ts,ps,hs,ns,sev,sigs,qd=score(x,sim,n)
                 trend63=trend_engine_v63(x)
-                # V6.3总评分中的趋势25%使用状态机趋势分，不再使用旧的简单趋势分。
+                # V6.3.1总评分中的趋势25%使用状态机趋势分，不再使用旧的简单趋势分。
                 ts=trend63["score"]
                 s1,s2,r1,r2,lo,hi,b1,b2,sl,t1,t2,pull=levels(x)
                 stage,stage_desc,tchecks,td=trend_stage(x)
@@ -1154,7 +1157,7 @@ if st.button("开始分析",type="primary",use_container_width=True):
                     total,opportunity,confidence,reli,net_plan_ev,rr,sev,conflict,stale
                 )
 
-                # V6.3 首页只保留交易者最需要的信息
+                # V6.3.1 首页只保留交易者最需要的信息
                 st.write("## 今日交易总结")
                 st.markdown(f'<div class="box"><div class="big">{final_label}</div>{final_reason}</div>',unsafe_allow_html=True)
                 a,b,c=st.columns(3)
@@ -1429,6 +1432,6 @@ if st.button("开始分析",type="primary",use_container_width=True):
                         tc=next((q for q in n.columns if "标题" in str(q) or str(q).lower()=="title"),n.columns[0])
                         for t in n[tc].head(8):st.write("• "+str(t))
                     st.line_chart(x.tail(80).set_index("日期")[["收盘","MA5","MA10","MA20","MA30","MA60"]])
-                    st.warning("V6.3使用公开行情接口，不是券商交易接口。实时数据和换手率估算可能存在延迟/口径差异；数据冲突时自动暂停信号。")
+                    st.warning("V6.3.1使用公开行情接口，不是券商交易接口。实时数据和换手率估算可能存在延迟/口径差异；数据冲突时自动暂停信号。")
 
             except Exception as e:st.error("计算异常："+str(e))
