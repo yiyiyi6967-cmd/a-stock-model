@@ -3,7 +3,7 @@ import pandas as pd, numpy as np, akshare as ak
 from datetime import datetime,timedelta
 import requests,time,random,re
 
-st.set_page_config(page_title="A股短线模型 V5.3",page_icon="📈",layout="centered")
+st.set_page_config(page_title="A股短线模型 V5.4",page_icon="📈",layout="centered")
 st.markdown("""<style>.block-container{padding-top:1rem;max-width:860px}.box{border:1px solid rgba(128,128,128,.25);border-radius:16px;padding:14px;margin:8px 0}.big{font-size:1.3rem;font-weight:700}[data-testid="stMetricValue"]{font-size:1.2rem}</style>""",unsafe_allow_html=True)
 POS=["中标","签订","合同","回购","增持","预增","扭亏","分红","重大项目","战略合作","获批","订单","业绩增长"]
 NEG=["减持","解禁","立案","调查","处罚","诉讼","亏损","预亏","退市","风险提示","终止","违约","冻结","问询函"]
@@ -122,47 +122,117 @@ def feat(x):
     x["POS20"]=(c-x.LOW20)/(x.HIGH20-x.LOW20).replace(0,np.nan)
     return x
 
-def similar(x):
+def similar(x, lookback=15, max_samples=60, min_gap=12):
+    """
+    V5.4 形态相似：
+    比较最近 lookback 根K线的标准化价格路径、成交量路径、MA结构、
+    RSI/MACD变化、实体/上下影和波动率。
+    候选案例之间至少间隔 min_gap 个交易日，避免连续日期重复计数。
+    """
     idx=len(x)-1
-    if idx<180:return None
-    cur=x.iloc[idx]
-    h=x.iloc[:idx-5].dropna(subset=["MA20","RSI","VR20","MACDH","ATR","POS20"]).copy()
-    cc=h["收盘"].astype(float)
-    d=(abs((cc/h.MA20-1)-(cur["收盘"]/cur.MA20-1))/.025
-       +abs(h.RSI-cur.RSI)/18
-       +abs(h.VR20-cur.VR20)/.8
-       +abs((h.MACDH/h.ATR.replace(0,np.nan))-(cur.MACDH/cur.ATR))/.7
-       +abs(h.POS20-cur.POS20)/.35)
-    cand=h.assign(_d=d).replace([np.inf,-np.inf],np.nan).dropna(subset=["_d"]).nsmallest(80,"_d")
+    if idx < lookback+180:return None
+
+    def vector(df, end):
+        w=df.iloc[end-lookback+1:end+1].copy()
+        if len(w)!=lookback:return None
+        close=w["收盘"].astype(float).to_numpy()
+        high=w["最高"].astype(float).to_numpy()
+        low=w["最低"].astype(float).to_numpy()
+        op=w["开盘"].astype(float).to_numpy()
+        vol=w["成交量"].astype(float).to_numpy()
+        if np.any(~np.isfinite(close)) or close[0]<=0:return None
+
+        # 价格路径：以窗口首日归一化
+        price=close/close[0]-1
+        # 日收益路径
+        ret=np.r_[0, close[1:]/close[:-1]-1]
+        # 成交量路径：相对窗口均量并截断异常值
+        vm=np.nanmean(vol)
+        volp=np.clip(vol/vm if vm>0 else np.ones_like(vol),0,4)
+        # K线实体与上下影
+        rng=np.maximum(high-low,1e-8)
+        body=(close-op)/np.maximum(op,1e-8)
+        lower=(np.minimum(op,close)-low)/rng
+        upper=(high-np.maximum(op,close))/rng
+        # 均线位置路径
+        ma5=w["MA5"].astype(float).to_numpy()
+        ma10=w["MA10"].astype(float).to_numpy()
+        ma20=w["MA20"].astype(float).to_numpy()
+        ma5p=close/ma5-1;ma10p=close/ma10-1;ma20p=close/ma20-1
+        # 动量路径标准化
+        rsi_p=(w["RSI"].astype(float).to_numpy()-50)/25
+        atr=w["ATR"].astype(float).to_numpy()
+        mac=np.divide(w["MACDH"].astype(float).to_numpy(),atr,out=np.zeros(lookback),where=np.isfinite(atr)&(atr!=0))
+        # 波动率
+        vola=np.nanstd(ret[1:]) if lookback>2 else 0
+
+        parts=[
+            price*3.0, ret*8.0, volp*.65,
+            body*6.0, lower*.55, upper*.55,
+            ma5p*4.0, ma10p*4.0, ma20p*5.0,
+            rsi_p*.55, np.clip(mac,-3,3)*.5,
+            np.array([vola*12])
+        ]
+        v=np.concatenate(parts)
+        return np.nan_to_num(v,nan=0,posinf=3,neginf=-3)
+
+    cur=vector(x,idx)
+    if cur is None:return None
+
+    candidates=[]
+    # 必须留出未来5日用于验证
+    for j in range(lookback+60,idx-5):
+        v=vector(x,j)
+        if v is None:continue
+        dist=float(np.sqrt(np.mean((v-cur)**2)))
+        candidates.append((dist,j))
+    candidates.sort(key=lambda q:q[0])
+
+    # 去重：相邻日期属于同一段行情，只保留更相似的一次
+    picked=[]
+    for dist,j in candidates:
+        if all(abs(j-k)>=min_gap for _,k in picked):
+            picked.append((dist,j))
+        if len(picked)>=max_samples:break
+
     rec=[]
-    for j in cand.index:
-        if j+5>=len(x):continue
+    for dist,j in picked:
         b=float(x.loc[j,"收盘"])
         f3=x.iloc[j+1:j+4];f5=x.iloc[j+1:j+6]
+        if len(f5)<5 or b<=0:continue
         r5=float(f5.iloc[-1]["收盘"]/b-1)
-        rec.append([f3["最高"].max()/b-1,
-                    f5["最高"].max()/b-1,
-                    r5,
-                    f5["最低"].min()/b-1])
-    if len(rec)<30:return None
-    r=np.array(rec,dtype=float)
-    r5=r[:,2]
-    wins=r5[r5>0];losses=r5[r5<=0]
-    win_rate=float((r5>0).mean())
-    avg_win=float(wins.mean()) if len(wins) else 0.0
-    avg_loss=float(losses.mean()) if len(losses) else 0.0
-    expectancy=float(r5.mean())
-    q25,q50,q75=np.quantile(r5,[.25,.50,.75])
-    return {"n":len(r),
-            "p33":float((r[:,0]>=.03).mean()),
-            "p35":float((r[:,0]>=.05).mean()),
-            "p55":float((r[:,1]>=.05).mean()),
-            "win":win_rate,
-            "avg":expectancy,
-            "avg_win":avg_win,
-            "avg_loss":avg_loss,
-            "q25":float(q25),"q50":float(q50),"q75":float(q75),
-            "dd":float(r[:,3].mean())}
+        rec.append({
+            "idx":j,"dist":dist,
+            "date":pd.Timestamp(x.loc[j,"日期"]),
+            "r3max":float(f3["最高"].max()/b-1),
+            "r5max":float(f5["最高"].max()/b-1),
+            "r5":r5,
+            "dd":float(f5["最低"].min()/b-1)
+        })
+    if len(rec)<20:return None
+
+    rr=np.array([q["r5"] for q in rec],float)
+    wins=rr[rr>0];losses=rr[rr<=0]
+    dists=np.array([q["dist"] for q in rec],float)
+    # 相似度只用于解释，不假装为严格概率：距离越小越接近100
+    simscore=float(100/(1+np.median(dists)*2.5))
+    q25,q50,q75=np.quantile(rr,[.25,.5,.75])
+    return {
+        "n":len(rec),
+        "p33":float(np.mean([q["r3max"]>=.03 for q in rec])),
+        "p35":float(np.mean([q["r3max"]>=.05 for q in rec])),
+        "p55":float(np.mean([q["r5max"]>=.05 for q in rec])),
+        "win":float((rr>0).mean()),
+        "avg":float(rr.mean()),
+        "avg_win":float(wins.mean()) if len(wins) else 0.0,
+        "avg_loss":float(losses.mean()) if len(losses) else 0.0,
+        "q25":float(q25),"q50":float(q50),"q75":float(q75),
+        "dd":float(np.mean([q["dd"] for q in rec])),
+        "similarity":simscore,
+        "cases":rec[:8],
+        "lookback":lookback,
+        "min_gap":min_gap
+    }
 
 def score(x,sim,n):
     z=x.iloc[-1];c=float(z["收盘"]);t=50;s=50;sig=[]
@@ -173,7 +243,7 @@ def score(x,sim,n):
     if z["收盘"]<p["收盘"] and z.VR20>1.5:s-=10;sig.append("⚠ 放量下跌")
     if z.LOWER>.42:s+=6;sig.append("✓ 长下影承接")
     if z.UPPER>.45:s-=5;sig.append("⚠ 长上影抛压")
-    hs=50 if not sim else int(np.clip(50+(sim["win"]-.5)*60+np.clip(sim["avg"]/.03,-1,1)*20+(sim["p33"]-.4)*25+(sim["p55"]-.3)*20,0,100))
+    hs=50 if not sim else int(np.clip(50+(sim["win"]-.5)*90+np.clip(sim["avg"]/.025,-1.5,1.5)*22+(sim["p55"]-.30)*18,0,100))
     ns=50;sev=False
     if not n.empty:
         tc=next((q for q in n.columns if "标题" in str(q) or str(q).lower()=="title"),n.columns[0])
@@ -193,8 +263,8 @@ def levels(x):
     else:lo=hi=np.nan
     return s1,s2,r1,r2,lo,hi,max(r1,float(z.HIGH20)*.995),(s1-.8*a if pull else c-1.25*a),max(r1,c+1.5*a),max(r2,c+2.4*a),pull
 
-st.title("📈 A股短线模型 V5.3")
-st.caption("双实时源校验 · 换手率双通道 · 交易期望/资金盈亏预测")
+st.title("📈 A股短线模型 V5.4")
+st.caption("真实K线形态相似 · 独立样本去重 · 交易期望 · 多源行情校验")
 code=st.text_input("输入6位A股代码",placeholder="例如：002159",max_chars=6)
 capital=st.number_input("模拟投入金额（元）",min_value=1000.0,max_value=10000000.0,value=10000.0,step=1000.0)
 
@@ -329,15 +399,29 @@ if st.button("开始分析",type="primary",use_container_width=True):
                     st.write(f"25%分位 **{sim['q25']*100:+.2f}%** ｜ 中位数 **{sim['q50']*100:+.2f}%** ｜ 75%分位 **{sim['q75']*100:+.2f}%**")
                     st.caption(f"若直接按历史5日平均收益折算，¥{capital:,.0f} 的统计期望约 {hist_ev_yuan:+,.0f} 元。未计佣金、滑点及实际成交偏差。")
 
-                st.write("### 历史盈利能力")
+                st.write("### 历史K线形态相似")
                 if sim:
-                    a,b,c=st.columns(3);a.metric("3日+3%",f"{sim['p33']*100:.1f}%");b.metric("3日+5%",f"{sim['p35']*100:.1f}%");c.metric("5日+5%",f"{sim['p55']*100:.1f}%")
-                    st.caption(f"样本 {sim['n']}｜5日收涨 {sim['win']*100:.1f}%｜平均5日 {sim['avg']*100:+.2f}%｜平均最低回撤 {sim['dd']*100:.2f}%")
+                    st.write(f"比较最近 **{sim['lookback']}根K线**：价格路径、成交量路径、MA5/10/20结构、RSI/MACD变化、实体/上下影与波动率。")
+                    st.write(f"独立相似案例 **{sim['n']}次** ｜ 案例间至少间隔 **{sim['min_gap']}个交易日** ｜ 形态接近度参考 **{sim['similarity']:.1f}/100**")
+                    upn=round(sim["win"]*sim["n"]);downn=sim["n"]-upn
+                    a,b,c=st.columns(3)
+                    a.metric("5日上涨",f"{upn}/{sim['n']}")
+                    b.metric("5日上涨率",f"{sim['win']*100:.1f}%")
+                    c.metric("5日平均",f"{sim['avg']*100:+.2f}%")
+                    st.write(f"上涨案例平均 **{sim['avg_win']*100:+.2f}%** ｜ 下跌案例平均 **{sim['avg_loss']*100:.2f}%**")
+                    st.write(f"25%分位 **{sim['q25']*100:+.2f}%** ｜ 中位数 **{sim['q50']*100:+.2f}%** ｜ 75%分位 **{sim['q75']*100:+.2f}%**")
+                    st.write(f"3日摸到+3%：**{sim['p33']*100:.1f}%** ｜ 3日摸到+5%：**{sim['p35']*100:.1f}%** ｜ 5日摸到+5%：**{sim['p55']*100:.1f}%**")
+                    with st.expander("查看最相似的历史案例"):
+                        for q in sim["cases"]:
+                            st.write(f"{q['date'].date()} ｜ 5日收盘 {q['r5']*100:+.2f}% ｜ 5日最高 {q['r5max']*100:+.2f}% ｜ 最大回撤 {q['dd']*100:.2f}%")
+                    st.caption("形态接近度是模型内部距离的可读化指标，不代表上涨概率。历史案例仅用于统计研究。")
+                else:
+                    st.warning("独立历史形态样本不足，暂不输出历史胜率。")
                 st.write("### 最新公开消息")
                 if n.empty:st.warning("消息接口不可用，消息按中性50。")
                 else:
                     tc=next((q for q in n.columns if "标题" in str(q) or str(q).lower()=="title"),n.columns[0])
                     for t in n[tc].head(8):st.write("• "+str(t))
                 st.line_chart(x.tail(80).set_index("日期")[["收盘","MA5","MA10","MA20","MA30","MA60"]])
-                st.warning("V5.3使用公开行情接口，不是券商交易接口。实时数据和换手率估算可能存在延迟/口径差异；数据冲突时自动暂停信号。")
+                st.warning("V5.4使用公开行情接口，不是券商交易接口。实时数据和换手率估算可能存在延迟/口径差异；数据冲突时自动暂停信号。")
             except Exception as e:st.error("计算异常："+str(e))
