@@ -3,7 +3,7 @@ import pandas as pd, numpy as np, akshare as ak
 from datetime import datetime,timedelta
 import requests,time,random,re
 
-st.set_page_config(page_title="A股短线模型 V6.3.4",page_icon="📈",layout="centered")
+st.set_page_config(page_title="A股短线模型 V6.3.5",page_icon="📈",layout="centered")
 st.markdown("""<style>.block-container{padding-top:1rem;max-width:860px}.box{border:1px solid rgba(128,128,128,.25);border-radius:16px;padding:14px;margin:8px 0}.big{font-size:1.3rem;font-weight:700}[data-testid="stMetricValue"]{font-size:1.2rem}</style>""",unsafe_allow_html=True)
 POS=["中标","签订","合同","回购","增持","预增","扭亏","分红","重大项目","战略合作","获批","订单","业绩增长"]
 NEG=["减持","解禁","立案","调查","处罚","诉讼","亏损","预亏","退市","风险提示","终止","违约","冻结","问询函"]
@@ -767,7 +767,7 @@ def chip_pressure(chip):
 
 def trade_price_plan(x, opportunity, s1, s2, r1, r2, b1, b2, sl, t1, t2, pull, lo, hi):
     """
-    V6.3.4 买卖价格计划。
+    V6.3.5 统一买卖价格计划。
     输出区间而非假装存在唯一精确价格。
     买入区综合支撑、ATR、回踩区和当前价；卖出区综合压力/目标位。
     """
@@ -1082,7 +1082,7 @@ def levels(x):
     t2=max(r2,c+2.4*a)
     return s1,s2,r1,r2,lo,hi,b1,b2,sl,t1,t2,pull
 
-st.title("📈 A股短线模型 V6.3.4")
+st.title("📈 A股短线模型 V6.3.5")
 st.caption("趋势状态机 · 趋势减速/拐点 · 5日完整路径 · 3日启动辅助 · TP/SL先后")
 code=st.text_input("输入6位A股代码",placeholder="例如：002159",max_chars=6)
 capital=st.number_input("模拟投入金额（元）",min_value=1000.0,max_value=10000000.0,value=10000.0,step=1000.0)
@@ -1128,10 +1128,13 @@ if st.button("开始分析",type="primary",use_container_width=True):
                 s1,s2,r1,r2,lo,hi,b1,b2,sl,t1,t2,pull=levels(x)
                 stage,stage_desc,tchecks,td=trend_stage(x)
 
-                # V5.3 交易计划期望：用相似样本胜率 + 当前计划止盈/止损
-                entry=(lo+hi)/2 if pull and np.isfinite(lo) and np.isfinite(hi) else close
-                target=t1
-                stop=sl
+                # V6.3.5：全站只使用一套交易价格计划。
+                # 首页、胜率/期望、盈亏比与模拟收益均引用同一个 price_plan，避免目标价不一致。
+                price_plan=trade_price_plan(x,None,s1,s2,r1,r2,b1,b2,sl,t1,t2,pull,lo,hi)
+                entry=(price_plan["buy_lo"]+price_plan["buy_hi"])/2
+                target=(price_plan["sell1_lo"]+price_plan["sell1_hi"])/2
+                target2=(price_plan["sell2_lo"]+price_plan["sell2_hi"])/2
+                stop=price_plan["stop"]
                 plan_up=max(target/entry-1,0.0) if entry>0 else 0.0
                 plan_down=max(1-stop/entry,0.0) if entry>0 else 0.0
                 # V5.9: 优先使用足量样本外胜率；否则使用保守胜率，不再直接用漂亮的原始胜率
@@ -1210,7 +1213,6 @@ if st.button("开始分析",type="primary",use_container_width=True):
                 elif total>=50:grade="观察"
                 else:grade="暂时回避"
 
-                price_plan=trade_price_plan(x,opportunity,s1,s2,r1,r2,b1,b2,sl,t1,t2,pull,lo,hi)
                 final_label,final_reason=final_trade_summary(
                     total,opportunity,confidence,reli,net_plan_ev,rr,sev,conflict,stale
                 )
@@ -1311,12 +1313,10 @@ if st.button("开始分析",type="primary",use_container_width=True):
                         st.caption("固定5日为主验证窗口，3日只评价启动速度；不根据哪一天表现最好临时挑周期。")
                         st.write(f"95%区间 {reli['lo']*100:.1f}%–{reli['hi']*100:.1f}% ｜ 可信度 {reli['confidence']:.0f}/100")
                     if sim:
-                        st.write(f"**计算买入价 ¥{entry:.2f}**")
-                        if pull and np.isfinite(lo) and np.isfinite(hi):
-                            st.caption(f"按建议买入区 ¥{lo:.2f}–¥{hi:.2f} 的中值计算；当前价与计划买入价分开。")
-                        else:
-                            st.caption("当前未生成有效回踩买入区，因此暂以当前参考价作为计算买入价。")
-                        st.write(f"买入 **¥{entry:.2f}** → 目标1 **¥{target:.2f}**：**+{plan_up*100:.2f}%**")
+                        st.write(f"**统一计划买入区 ¥{price_plan['buy_lo']:.2f}–¥{price_plan['buy_hi']:.2f} ｜ 计算买入价 ¥{entry:.2f}**")
+                        st.caption("计算买入价固定取首页建议买入区中值；首页与本页不再使用两套买入逻辑。")
+                        st.write(f"第一卖出区 **¥{price_plan['sell1_lo']:.2f}–¥{price_plan['sell1_hi']:.2f}** ｜ 计算目标价 **¥{target:.2f}**：**+{plan_up*100:.2f}%**")
+                        st.write(f"第二卖出区 **¥{price_plan['sell2_lo']:.2f}–¥{price_plan['sell2_hi']:.2f}** ｜ 中值 **¥{target2:.2f}**")
                         st.write(f"买入 **¥{entry:.2f}** → 止损 **¥{stop:.2f}**：**-{plan_down*100:.2f}%**")
                         st.write(f"计划盈亏比 **{rr:.2f}:1** ｜ 毛期望 **{plan_ev*100:+.2f}%** ｜ 摩擦后期望 **{net_plan_ev*100:+.2f}%**")
                         st.write(f"模拟本金 ¥{capital:,.0f} ｜ 毛统计期望约 {expected_yuan:+,.0f} 元 ｜ 摩擦后约 {net_expected_yuan:+,.0f} 元")
@@ -1370,8 +1370,8 @@ if st.button("开始分析",type="primary",use_container_width=True):
                     else:
                         st.write("趋势尚未满足回踩策略条件。")
                     st.write(f"第一压力突破观察 **¥{b1:.2f}** ｜ 结构突破确认 **¥{b2:.2f}**")
-                    st.write(f"止损/无效参考 **¥{sl:.2f}** ｜ 目标1 **¥{t1:.2f}** ｜ 目标2 **¥{t2:.2f}**")
-                    st.caption("第一压力突破=短线初步转强；结构突破=突破20日结构高点/更高压力，确认级别更高。")
+                    st.write(f"统一计划：买入 **¥{price_plan['buy_lo']:.2f}–¥{price_plan['buy_hi']:.2f}** ｜ 第一卖出 **¥{price_plan['sell1_lo']:.2f}–¥{price_plan['sell1_hi']:.2f}** ｜ 第二卖出 **¥{price_plan['sell2_lo']:.2f}–¥{price_plan['sell2_hi']:.2f}** ｜ 止损 **¥{price_plan['stop']:.2f}**")
+                    st.caption("第一压力突破=短线初步转强；结构突破=突破20日结构高点/更高压力。原始技术目标仍参与统一价格计划计算，但不再作为另一套独立卖出价展示。")
                     st.write("### 量价 / K线真实性")
                     a,b,c=st.columns(3)
                     a.metric("20日量比",f"{qd['vr20']:.2f}×")
