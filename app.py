@@ -110,7 +110,7 @@ def market_snapshot():
 
 @st.cache_data(ttl=60*60*12,show_spinner=False)
 def representative_universe():
-    """V8.4.1：只保留沪深主板；不扫描全A，使用代表性指数池。"""
+    """V8.4.2：只保留沪深主板；不扫描全A，使用代表性指数池。"""
     pools=[("沪深核心","000300",35),("中盘","000905",30),("小盘","000852",30)]
     frames=[];errors=[]
     def main_board(code):
@@ -1232,6 +1232,16 @@ def cache_stats():
             return con.execute("SELECT COUNT(DISTINCT code),COUNT(*) FROM kline_cache").fetchone()
     except Exception:return (0,0)
 
+def cache_inventory():
+    """列出全部缓存股票；移出候选池/持仓不删除K线。"""
+    try:
+        with _db() as con:
+            rows=con.execute("""SELECT code,COUNT(*),MIN(trade_date),MAX(trade_date)
+                                FROM kline_cache GROUP BY code ORDER BY code""").fetchall()
+        return [{"代码":r[0],"K线条数":r[1],"最早日期":r[2],"最新日期":r[3]} for r in rows]
+    except Exception:
+        return []
+
 
 def migrate_legacy_json_bytes(data):
     """导入V7/V8旧版watchlist JSON；尽量保留候选池、快照、淘汰记录和持仓。"""
@@ -1431,7 +1441,7 @@ def weekly_top20(scan_day):
     return out
 
 def refresh_watch_item(code,name=""):
-    # V8.4.1：缓存是“完整历史底座”，新行情只是增量。
+    # V8.4.2：缓存是“完整历史底座”，新行情只是增量。
     # 每次分析前把缓存历史 + 本次新数据按日期合并、去重、排序，
     # 因此所有指标/历史相似/样本外统计始终基于完整时间序列。
     old_cache=cached_hist(code)
@@ -1469,8 +1479,8 @@ def refresh_watch_item(code,name=""):
             "5日胜率":snap["winrate"],"现价":snap["close"],"建议买入":f'{pp["buy_lo"]:.2f}–{pp["buy_hi"]:.2f}',
             "第一卖出":f'{pp["sell1_lo"]:.2f}–{pp["sell1_hi"]:.2f}',"止损":round(pp["stop"],2),"_snapshot":snap}
 
-st.title("📈 A股短线模型 V8.4.1")
-st.caption("持仓重点监控 · 全历史增量缓存 · 旧版迁移 · 数据库备份恢复 · 自选Top20")
+st.title("📈 A股短线模型 V8.4.2")
+st.caption("持仓重点监控 · 永久K线缓存 · 增量合并 · 旧版迁移 · 数据库备份恢复 · 自选Top20")
 
 page=st.radio("模式",["⭐ 自选股票池","🔎 个股分析"],horizontal=True,label_visibility="collapsed")
 if "selected_code" not in st.session_state: st.session_state.selected_code="002159"
@@ -1576,7 +1586,14 @@ if page=="⭐ 自选股票池":
         st.info("暂无已标记持仓。")
 
     stocks,bars=cache_stats()
-    st.caption(f"💾 本地行情缓存：{stocks} 只股票 / {bars} 条日K。分析时使用“历史缓存 + 最新数据”的完整合并序列。")
+    st.caption(f"💾 本地行情缓存：{stocks} 只股票 / {bars} 条日K。候选淘汰、手动删除或移出持仓后，历史K线仍然保留。")
+    with st.expander("📚 查看已缓存股票"):
+        inv=cache_inventory()
+        if inv:
+            st.dataframe(pd.DataFrame(inv),use_container_width=True,hide_index=True)
+            st.caption("重新加入股票时，历史缓存与最新行情按日期合并、去重，再运行完整模型。")
+        else:
+            st.caption("当前还没有已缓存股票行情。")
     with st.expander("🗄️ 数据库备份 / 恢复"):
         st.caption("备份包含：候选池、持仓、淘汰状态、每日快照以及已缓存日K。升级或重新部署前建议先下载备份。")
         st.markdown("**旧版本数据迁移**")
