@@ -110,7 +110,7 @@ def market_snapshot():
 
 @st.cache_data(ttl=60*60*12,show_spinner=False)
 def representative_universe():
-    """V8.4：只保留沪深主板；不扫描全A，使用代表性指数池。"""
+    """V8.4.1：只保留沪深主板；不扫描全A，使用代表性指数池。"""
     pools=[("沪深核心","000300",35),("中盘","000905",30),("小盘","000852",30)]
     frames=[];errors=[]
     def main_board(code):
@@ -1431,7 +1431,7 @@ def weekly_top20(scan_day):
     return out
 
 def refresh_watch_item(code,name=""):
-    # V8.4：缓存是“完整历史底座”，新行情只是增量。
+    # V8.4.1：缓存是“完整历史底座”，新行情只是增量。
     # 每次分析前把缓存历史 + 本次新数据按日期合并、去重、排序，
     # 因此所有指标/历史相似/样本外统计始终基于完整时间序列。
     old_cache=cached_hist(code)
@@ -1469,7 +1469,7 @@ def refresh_watch_item(code,name=""):
             "5日胜率":snap["winrate"],"现价":snap["close"],"建议买入":f'{pp["buy_lo"]:.2f}–{pp["buy_hi"]:.2f}',
             "第一卖出":f'{pp["sell1_lo"]:.2f}–{pp["sell1_hi"]:.2f}',"止损":round(pp["stop"],2),"_snapshot":snap}
 
-st.title("📈 A股短线模型 V8.4")
+st.title("📈 A股短线模型 V8.4.1")
 st.caption("持仓重点监控 · 全历史增量缓存 · 旧版迁移 · 数据库备份恢复 · 自选Top20")
 
 page=st.radio("模式",["⭐ 自选股票池","🔎 个股分析"],horizontal=True,label_visibility="collapsed")
@@ -1494,15 +1494,35 @@ if page=="⭐ 自选股票池":
         hcost=st.number_input("持仓成本",min_value=0.0,step=0.01,key="holding_cost")
         hshares=st.number_input("持仓股数",min_value=0,step=100,key="holding_shares")
         if st.button("保存持仓",use_container_width=True):
-            m=re.search(r"(\\d{6})",hc or "")
-            if not m: st.warning("请输入6位股票代码。")
+            m=re.search(r"(\d{6})", str(hc or "").strip())
+            if not m:
+                st.warning("请输入正确的6位股票代码，例如 603027。")
             else:
-                code=m.group(1); found=False
+                code=m.group(1)
+                if not code.startswith(("600","601","603","605","000","001","002","003")):
+                    st.warning("当前模型只保留沪深主板股票，请检查代码。")
+                    st.stop()
+                found=False
                 for h in state["holdings"]:
                     if str(h.get("代码","")).zfill(6)==code:
                         h.update({"成本":float(hcost),"股数":int(hshares)}); found=True
-                if not found: state["holdings"].append({"代码":code,"名称":"","成本":float(hcost),"股数":int(hshares)})
-                _save_state(state); st.rerun()
+                if not found:
+                    state["holdings"].append({"代码":code,"名称":"","成本":float(hcost),"股数":int(hshares)})
+                # 保存持仓后立即尝试建立分析记录。已有K线缓存时可直接参与完整历史分析；
+                # 若实时接口暂时失败，refresh_watch_item 会自动回退 SQLite 缓存。
+                existing=next((x for x in state["watchlist"] if str(x.get("代码","")).zfill(6)==code),None)
+                if existing is None:
+                    try:
+                        r=refresh_watch_item(code,"")
+                        r.pop("_snapshot",None)
+                        r["低质量连续天数"]=0
+                        r["低质量状态"]="持仓保护"
+                        state["watchlist"].append(r)
+                    except Exception:
+                        pass
+                _save_state(state)
+                st.success(f"持仓 {code} 已保存。")
+                st.rerun()
 
     if state["holdings"]:
         hrows=[]
