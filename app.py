@@ -1,9 +1,10 @@
 import streamlit as st
 import pandas as pd, numpy as np, akshare as ak
 from datetime import datetime,timedelta
+from zoneinfo import ZoneInfo
 import requests,time,random,re
 
-st.set_page_config(page_title="A股短线模型 V6.3.5",page_icon="📈",layout="centered")
+st.set_page_config(page_title="A股短线模型 V6.6",page_icon="📈",layout="centered")
 st.markdown("""<style>.block-container{padding-top:1rem;max-width:860px}.box{border:1px solid rgba(128,128,128,.25);border-radius:16px;padding:14px;margin:8px 0}.big{font-size:1.3rem;font-weight:700}[data-testid="stMetricValue"]{font-size:1.2rem}</style>""",unsafe_allow_html=True)
 POS=["中标","签订","合同","回购","增持","预增","扭亏","分红","重大项目","战略合作","获批","订单","业绩增长"]
 NEG=["减持","解禁","立案","调查","处罚","诉讼","亏损","预亏","退市","风险提示","终止","违约","冻结","问询函"]
@@ -70,6 +71,38 @@ def quote_tencent(code):
     a=m.group(1).split("~")
     if len(a)<6:raise RuntimeError("腾讯实时字段不足")
     return {"source":"腾讯实时","name":a[1],"price":float(a[3]),"preclose":float(a[4]),"open":float(a[5])}
+
+
+
+def board_name(code):
+    code=str(code).zfill(6)
+    if code.startswith(("4","8")): return "北交所"
+    if code.startswith("688"): return "科创板"
+    if code.startswith("300"): return "创业板"
+    if code.startswith(("600","601","603","605","000","001","002","003")): return "沪深主板"
+    return "其他A股"
+
+@st.cache_data(ttl=180,show_spinner=False)
+def market_snapshot():
+    """全A快照只做市场初筛；完整模型仍在点入个股后运行，避免把快照分冒充完整模型分。"""
+    x=retry(lambda:ak.stock_zh_a_spot_em(),2)
+    if x is None or x.empty: raise RuntimeError("全A市场快照暂不可用")
+    ren={"代码":"代码","名称":"名称","最新价":"现价","涨跌幅":"涨跌幅","成交额":"成交额",
+         "换手率":"换手率","量比":"量比","市盈率-动态":"市盈率","总市值":"总市值"}
+    cols=[c for c in ren if c in x.columns]
+    y=x[cols].rename(columns=ren).copy()
+    y["代码"]=y["代码"].astype(str).str.zfill(6)
+    y["交易板块"]=y["代码"].map(board_name)
+    for c in ["现价","涨跌幅","成交额","换手率","量比","市盈率","总市值"]:
+        if c in y:y[c]=pd.to_numeric(y[c],errors="coerce")
+    # 只用于全市场排序的初筛分：流动性+活跃度+当日强弱；绝不替代完整模型综合评分。
+    pct=y.get("涨跌幅",pd.Series(0,index=y.index)).clip(-10,10)
+    turn=y.get("换手率",pd.Series(0,index=y.index)).clip(0,20)
+    vr=y.get("量比",pd.Series(1,index=y.index)).clip(.2,5)
+    amt=y.get("成交额",pd.Series(0,index=y.index)).fillna(0)
+    liq=np.log10(amt.clip(lower=1))
+    y["市场初筛分"]=(50 + pct*1.8 + np.minimum(turn,8)*1.2 + (vr-1)*5 + (liq-8)*4).clip(0,100).round().astype("Int64")
+    return y.sort_values(["市场初筛分","成交额"],ascending=False).reset_index(drop=True)
 
 def get_quotes(code):
     out=[];errs=[]
@@ -1082,12 +1115,184 @@ def levels(x):
     t2=max(r2,c+2.4*a)
     return s1,s2,r1,r2,lo,hi,b1,b2,sl,t1,t2,pull
 
-st.title("📈 A股短线模型 V6.3.5")
-st.caption("趋势状态机 · 趋势减速/拐点 · 5日完整路径 · 3日启动辅助 · TP/SL先后")
-code=st.text_input("输入6位A股代码",placeholder="例如：002159",max_chars=6)
-capital=st.number_input("模拟投入金额（元）",min_value=1000.0,max_value=10000000.0,value=10000.0,step=1000.0)
 
-if st.button("开始分析",type="primary",use_container_width=True):
+def eod_scan_date():
+    """以上海时间决定应展示的最近一次收盘扫描日期。"""
+    now=datetime.now(ZoneInfo("Asia/Shanghai"))
+    d=now.date()
+    # 周末回退到周五；工作日15:10前回退到前一交易日（节假日由行情日期再次校正）
+    if d.weekday()>=5:
+        d=d-timedelta(days=d.weekday()-4)
+    elif now.hour<15 or (now.hour==15 and now.minute<10):
+        d=d-timedelta(days=1)
+        while d.weekday()>=5:d-=timedelta(days=1)
+    return str(d)
+
+@st.cache_data(ttl=60*60*18,show_spinner=False)
+def daily_top20(scan_day):
+    """
+    V6.6 收盘雷达：
+    不是全A逐只跑完整模型。
+    1) 全市场快照仅用于轻量板块/活跃度初筛；
+    2) 每个交易板块抽取少量候选，构成约60只候选池；
+    3) 只对候选池跑历史+趋势+统计核心模型；
+    4) 最终Top20限制单一交易板块集中度，避免榜单被一个板块占满。
+    """
+    snap=market_snapshot().copy()
+    snap=snap[~snap["名称"].astype(str).str.contains(r"ST|退",case=False,regex=True,na=False)]
+    snap=snap[pd.to_numeric(snap["现价"],errors="coerce")>0]
+    snap=snap[pd.to_numeric(snap.get("成交额",0),errors="coerce").fillna(0)>0]
+
+    # 轻量市场状态：只用快照聚合，不请求每只股票历史。
+    # 交易板块内取中位涨跌、上涨家数比例、量比/换手活跃度，决定候选配额。
+    board_rows=[]
+    for b,g in snap.groupby("交易板块"):
+        if b=="其他A股" or len(g)<5: continue
+        pct=pd.to_numeric(g["涨跌幅"],errors="coerce")
+        vr=pd.to_numeric(g.get("量比",1),errors="coerce")
+        turn=pd.to_numeric(g.get("换手率",0),errors="coerce")
+        breadth=float((pct>0).mean())
+        strength=float(np.nanmedian(pct))
+        activity=float(np.nanmedian(vr.fillna(1))) + .08*float(np.nanmedian(turn.fillna(0)))
+        bscore=50 + np.clip(strength,-5,5)*5 + (breadth-.5)*35 + np.clip(activity-1,-1,2)*6
+        board_rows.append((b,float(np.clip(bscore,0,100)),len(g)))
+    board_rank=pd.DataFrame(board_rows,columns=["交易板块","板块机会分","股票数"]).sort_values("板块机会分",ascending=False)
+
+    # 不做全盘完整扫描。优先从强板块抽候选，同时保留少量其他板块，防止漏掉逆板块个股。
+    pools=[]
+    quota_map={}
+    for rank,(_,br) in enumerate(board_rank.iterrows()):
+        b=br["交易板块"]; bs=float(br["板块机会分"])
+        # 强板块18只，中等12只，偏弱8只；总池通常约50-60只。
+        quota=18 if rank==0 else 14 if rank==1 else 10 if rank==2 else 8
+        if bs<42: quota=min(quota,6)
+        g=snap[snap["交易板块"]==b].sort_values(["市场初筛分","成交额"],ascending=False)
+        q=g.head(quota).copy()
+        q["板块机会分"]=round(bs,1)
+        pools.append(q);quota_map[b]=len(q)
+    pool=pd.concat(pools,ignore_index=True) if pools else snap.head(50).copy()
+    pool=pool.sort_values(["板块机会分","市场初筛分","成交额"],ascending=False).head(60)
+
+    rows=[]
+    for _,r in pool.iterrows():
+        code=str(r["代码"]).zfill(6)
+        try:
+            raw,hsrc,_=get_hist(code)
+            if raw is None or len(raw)<120:continue
+            x=feat(raw).reset_index(drop=True)
+            sim=similar(x);reli=winrate_reliability(sim);oos=oos_grade_v633(reli)
+            n=pd.DataFrame();chip=chip_model(x,None)
+            ts,ps,hs,ns,sev,sigs,qd=score(x,sim,n)
+            trend=trend_engine_v63(x);ts=trend["score"]
+            s1,s2,r1,r2,lo,hi,b1,b2,sl,t1,t2,pull=levels(x)
+            pp=trade_price_plan(x,None,s1,s2,r1,r2,b1,b2,sl,t1,t2,pull,lo,hi)
+            entry=(pp["buy_lo"]+pp["buy_hi"])/2;target=(pp["sell1_lo"]+pp["sell1_hi"])/2;stop=pp["stop"]
+            up=max(target/entry-1,0) if entry>0 else 0;down=max(1-stop/entry,0) if entry>0 else 0
+            wr=(float(reli["test"]["win"]) if reli and reli["enough_oos"] else float(reli["conservative"]) if reli else np.nan)
+            ev=(wr*up-(1-wr)*down) if np.isfinite(wr) else np.nan;rr=up/down if down>0 else np.nan
+            path=path_trade_stats(sim,up,down);hist25=historical_score_25(sim,reli,path,up,down)
+            if sim and reli:hs=hist25["score100"]
+            opp=current_opportunity(x,chip,qd,sim,reli,ev,rr)
+            conf=trading_confidence(reli,True)
+            total,_=dynamic_total(ts,ps,hs,ns,chip,sim,ev,rr,news_available=False,reli=reli)
+            if sev:total=min(total,55)
+            rows.append({"代码":code,"名称":r["名称"],"交易板块":r["交易板块"],
+                         "板块机会分":float(r.get("板块机会分",50)),
+                         "综合评分":int(total),"机会分":int(opp),"可信度":int(conf),
+                         "趋势状态":trend["state"],
+                         "买入区":f'{pp["buy_lo"]:.2f}–{pp["buy_hi"]:.2f}',"止损":round(stop,2),
+                         "目标1":f'{pp["sell1_lo"]:.2f}–{pp["sell1_hi"]:.2f}',
+                         "目标2":f'{pp["sell2_lo"]:.2f}–{pp["sell2_hi"]:.2f}',
+                         "样本外":oos["level"],"历史源":hsrc})
+        except Exception:
+            continue
+
+    if not rows:return pd.DataFrame()
+    ranked=pd.DataFrame(rows).sort_values(
+        ["综合评分","机会分","可信度","板块机会分"],ascending=False)
+
+    # 最终榜单做集中度控制：同一交易板块最多6只。
+    selected=[];counts={}
+    for _,r in ranked.iterrows():
+        b=r["交易板块"]
+        if counts.get(b,0)>=6: continue
+        selected.append(r)
+        counts[b]=counts.get(b,0)+1
+        if len(selected)>=20: break
+    out=pd.DataFrame(selected)
+    if out.empty:return out
+    out=out.reset_index(drop=True);out.index=out.index+1
+    out.attrs["candidate_count"]=len(pool)
+    out.attrs["board_rank"]=board_rank.to_dict("records")
+    return out
+
+st.title("📈 A股短线模型 V6.6")
+st.caption("板块机会雷达 · 少量候选深度扫描 · 每日Top20 · 点入个股完整分析")
+
+page=st.radio("模式",["🔭 全市场选股","🔎 个股分析"],horizontal=True,label_visibility="collapsed")
+if "selected_code" not in st.session_state: st.session_state.selected_code="002159"
+
+if page=="🔭 全市场选股":
+    st.subheader("🏆 每日收盘 Top20")
+    scan_day=eod_scan_date()
+    st.caption(f"收盘扫描日：{scan_day}｜先按板块机会轻量筛选，再对约60只候选运行核心模型；不对全A逐只深度回测，降低卡死和接口限流风险。")
+    try:
+        with st.spinner("首次打开正在扫描候选并计算 Top20，之后打开会直接读取当天缓存…"):
+            top20=daily_top20(scan_day)
+        if top20 is not None and not top20.empty:
+            board_top=st.selectbox("Top20板块",["全部"]+list(top20["交易板块"].dropna().unique()),key="top_board")
+            tv=top20 if board_top=="全部" else top20[top20["交易板块"]==board_top]
+            evtop=st.dataframe(tv,use_container_width=True,on_select="rerun",selection_mode="single-row",height=430)
+            rrsel=evtop.selection.rows if hasattr(evtop,"selection") else []
+            if rrsel:
+                pick=tv.iloc[rrsel[0]];st.session_state.selected_code=str(pick["代码"]).zfill(6)
+                if st.button("打开 Top20 选中股票完整分析",type="primary",use_container_width=True):
+                    st.session_state.auto_analyze=True;st.session_state.page_to_analysis=True;st.rerun()
+        else: st.info("本次扫描没有得到足够的有效候选。")
+    except Exception as e:
+        st.warning(f"Top20 自动扫描暂不可用：{e}")
+
+    st.divider()
+    st.subheader("全A市场雷达")
+    st.caption("下面保留全市场快照浏览。市场初筛分只负责缩小候选池，不等同于最终综合评分。")
+    try:
+        snap=market_snapshot()
+        boards=["全部"]+list(snap["交易板块"].dropna().unique())
+        board=st.selectbox("交易板块",boards)
+        q=st.text_input("搜索股票代码/名称",placeholder="例如：证券、600958")
+        view=snap if board=="全部" else snap[snap["交易板块"]==board]
+        if q:
+            q=q.strip();view=view[view["代码"].str.contains(q,case=False,na=False)|view["名称"].astype(str).str.contains(q,case=False,na=False)]
+        showcols=[c for c in ["代码","名称","交易板块","现价","涨跌幅","换手率","量比","成交额","市场初筛分"] if c in view]
+        event=st.dataframe(view[showcols].head(500),use_container_width=True,hide_index=True,on_select="rerun",selection_mode="single-row",height=520)
+        rows=event.selection.rows if hasattr(event,"selection") else []
+        if rows:
+            row=view[showcols].head(500).iloc[rows[0]]
+            st.session_state.selected_code=str(row["代码"]).zfill(6)
+            st.info(f"已选：{row.get('名称','')} {st.session_state.selected_code}｜{row.get('交易板块','')}")
+            if st.button("打开这只股票的完整分析",type="primary",use_container_width=True):
+                st.session_state.auto_analyze=True
+                st.session_state.page_to_analysis=True
+                st.rerun()
+        st.caption("默认展示当前筛选结果前500只；可按交易板块或名称/代码缩小范围。完整分析在点入个股后计算。")
+    except Exception as e:
+        st.warning(f"全市场快照暂时不可用：{e}")
+        st.caption("不影响下面的单股分析；数据源恢复后市场雷达会自动恢复。")
+
+if st.session_state.pop("page_to_analysis",False): page="🔎 个股分析"
+
+if page=="🔎 个股分析":
+    code=st.text_input("输入6位A股代码",value=st.session_state.selected_code,placeholder="例如：002159",max_chars=6,key="code_input")
+    st.session_state.selected_code=code
+    st.caption(f"交易板块：{board_name(code) if code.isdigit() and len(code)==6 else '—'}")
+    capital=st.number_input("模拟投入金额（元）",min_value=1000.0,max_value=10000000.0,value=10000.0,step=1000.0)
+    run_now=st.button("开始分析",type="primary",use_container_width=True) or st.session_state.pop("auto_analyze",False)
+else:
+    code=st.session_state.selected_code
+    capital=10000.0
+    run_now=False
+
+if run_now:
     if not(code.isdigit() and len(code)==6):st.error("请输入正确6位代码")
     else:
         raw,hsrc,herrs=get_hist(code)
