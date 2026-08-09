@@ -108,7 +108,7 @@ def market_snapshot():
 
 @st.cache_data(ttl=60*60*12,show_spinner=False)
 def representative_universe():
-    """V7.1：只保留沪深主板；不扫描全A，使用代表性指数池。"""
+    """V8.0：只保留沪深主板；不扫描全A，使用代表性指数池。"""
     pools=[("沪深核心","000300",35),("中盘","000905",30),("小盘","000852",30)]
     frames=[];errors=[]
     def main_board(code):
@@ -1298,77 +1298,133 @@ def refresh_watch_item(code,name=""):
             "5日胜率":snap["winrate"],"现价":snap["close"],"建议买入":f'{pp["buy_lo"]:.2f}–{pp["buy_hi"]:.2f}',
             "第一卖出":f'{pp["sell1_lo"]:.2f}–{pp["sell1_hi"]:.2f}',"止损":round(pp["stop"],2),"_snapshot":snap}
 
-st.title("📈 A股短线模型 V7.1")
-st.caption("快速周选股 · 工作日跟踪 · 沪深主板 · 5日±2% · 最多24只深度评分")
+st.title("📈 A股短线模型 V8.0")
+st.caption("自选股票池 · 手动增删 · Top20排序 · 收盘后批量更新 · 胜率变化归因")
 
-page=st.radio("模式",["📅 本周股票池","🔎 个股分析"],horizontal=True,label_visibility="collapsed")
+page=st.radio("模式",["⭐ 自选股票池","🔎 个股分析"],horizontal=True,label_visibility="collapsed")
 if "selected_code" not in st.session_state: st.session_state.selected_code="002159"
 
-if page=="📅 本周股票池":
-    state=_load_state(); wk=week_key()
-    st.subheader("🏆 本周 Top20")
-    st.caption("仅沪深主板；最近5个交易日累计涨跌 -2%～+2% 初筛，最多24只进入完整模型。生成后本周冻结。")
-    if state.get("week")!=wk: st.info("新的一周尚未生成股票池。")
-    if st.button("生成 / 重建本周 Top20",type="primary",use_container_width=True):
-        with st.spinner("正在周度筛选…"): top=weekly_top20(eod_scan_date())
-        if top is not None and not top.empty:
-            state={"week":wk,"watchlist":top.reset_index(drop=True).to_dict("records"),"deleted":[],"snapshots":{}}
-            _save_state(state); st.success(f"已生成 {len(top)} 只候选。"); st.rerun()
-        else: st.warning("本次没有得到有效候选。")
+if page=="⭐ 自选股票池":
+    state=_load_state()
+    if "watchlist" not in state: state["watchlist"]=[]
+    if "snapshots" not in state: state["snapshots"]={}
+    st.subheader("⭐ 我的候选股票池")
+    st.caption("你提供股票代码，模型只分析这些股票；不再扫描全A。支持批量添加、删除、更新和Top20排序。")
 
-    if state.get("watchlist"):
+    raw_codes=st.text_area(
+        "批量输入股票代码",
+        placeholder="例如：\n600519  000858  601318\n也支持逗号、空格或换行分隔",
+        height=110
+    )
+    c1,c2=st.columns(2)
+    add_clicked=c1.button("＋ 添加并分析",type="primary",use_container_width=True)
+    refresh_clicked=c2.button("↻ 更新全部",use_container_width=True)
+
+    def _parse_codes(txt):
+        vals=re.findall(r'(?<!\d)(\d{6})(?!\d)',txt or "")
+        out=[]
+        for x in vals:
+            # 沪深主板为主；仍允许用户显式输入其它6位代码，但提示由个股接口决定是否可分析
+            if x not in out: out.append(x)
+        return out
+
+    if add_clicked:
+        codes=_parse_codes(raw_codes)
+        existing={str(x.get("代码","")).zfill(6) for x in state["watchlist"]}
+        new=[x for x in codes if x not in existing]
+        if not codes:
+            st.warning("没有识别到6位股票代码。")
+        elif not new:
+            st.info("输入的股票已经在候选池中。")
+        else:
+            bar=st.progress(0); msg=st.empty()
+            for i,code in enumerate(new):
+                msg.info(f"正在分析新股票 {i+1}/{len(new)}：{code}")
+                try:
+                    r=refresh_watch_item(code,"")
+                    snap=r.pop("_snapshot",{})
+                    r["代码"]=code
+                    state["watchlist"].append(r)
+                    state["snapshots"].setdefault(code,{})[eod_scan_date()]=snap
+                except Exception as e:
+                    state["watchlist"].append({"代码":code,"名称":"","更新错误":str(e)[:100]})
+                bar.progress((i+1)/len(new))
+            _save_state(state); bar.empty(); msg.success(f"新增完成：{len(new)} 只。"); st.rerun()
+
+    if refresh_clicked and state["watchlist"]:
+        today=eod_scan_date(); bar=st.progress(0); msg=st.empty()
+        for i,item in enumerate(state["watchlist"]):
+            code=str(item.get("代码","")).zfill(6)
+            msg.info(f"收盘更新 {i+1}/{len(state['watchlist'])}：{code}")
+            try:
+                r=refresh_watch_item(code,item.get("名称",""))
+                cur=r.pop("_snapshot",{})
+                hist=state["snapshots"].setdefault(code,{})
+                prev=hist[sorted(hist)[-1]] if hist else None
+                hist[today]=cur
+                r["胜率变化"]=None if not prev or cur.get("winrate") is None or prev.get("winrate") is None else round(cur["winrate"]-prev["winrate"],1)
+                r["变化原因"]="；".join(explain_winrate_change(prev,cur))
+                item.update(r)
+            except Exception as e:
+                item["更新错误"]=str(e)[:100]
+            bar.progress((i+1)/len(state["watchlist"]))
+        _save_state(state); bar.empty(); msg.success("全部更新完成。"); st.rerun()
+
+    if state["watchlist"]:
         df=pd.DataFrame(state["watchlist"])
-        cols=[c for c in ["代码","名称","交易板块","5日涨跌","综合评分","机会分","可信度","5日胜率","买入区","止损","目标1","股票质量","当前机会","交易可信度","胜率变化"] if c in df.columns]
-        ev=st.dataframe(df[cols],use_container_width=True,hide_index=True,on_select="rerun",selection_mode="single-row",height=440)
-        sel=ev.selection.rows if hasattr(ev,"selection") else []
-        if sel:
-            row=df.iloc[sel[0]]; st.session_state.selected_code=str(row["代码"]).zfill(6)
-            c1,c2=st.columns(2)
-            c1.caption("已选中，可切换到“个股分析”查看完整模型。")
-            if c2.button("🗑️ 从本周删除",use_container_width=True):
-                removed=state["watchlist"].pop(sel[0])
-                state.setdefault("deleted",[]).append({"代码":removed["代码"],"名称":removed.get("名称",""),"删除时间":datetime.now().isoformat(timespec="minutes")})
+        # Unified ranking: favor quality/opportunity/reliability while keeping actual win-rate visible.
+        for col in ["股票质量","当前机会","交易可信度","5日胜率","综合评分","机会分","可信度"]:
+            if col not in df.columns: df[col]=None
+        q=pd.to_numeric(df["股票质量"].fillna(df["综合评分"]),errors="coerce").fillna(0)
+        o=pd.to_numeric(df["当前机会"].fillna(df["机会分"]),errors="coerce").fillna(0)
+        c=pd.to_numeric(df["交易可信度"].fillna(df["可信度"]),errors="coerce").fillna(0)
+        w=pd.to_numeric(df["5日胜率"],errors="coerce").fillna(50)
+        df["Top20评分"]=(q*.30+o*.30+c*.25+w*.15).round(1)
+        df=df.sort_values(["Top20评分","交易可信度","当前机会"],ascending=False).reset_index(drop=True)
+        df["排名"]=range(1,len(df)+1)
+
+        st.subheader(f"🏆 Top20（候选池 {len(df)} 只）")
+        top=df.head(20)
+        wanted=["排名","代码","名称","Top20评分","股票质量","当前机会","交易可信度","5日胜率",
+                "胜率变化","买入区","止损","目标1","目标2","变化原因","更新错误"]
+        show=[x for x in wanted if x in top.columns]
+        ev=st.dataframe(top[show],use_container_width=True,hide_index=True,
+                        on_select="rerun",selection_mode="single-row",height=500)
+        rows=ev.selection.rows if hasattr(ev,"selection") else []
+        if rows:
+            rr=top.iloc[rows[0]]
+            st.session_state.selected_code=str(rr["代码"]).zfill(6)
+            d1,d2=st.columns(2)
+            d1.caption("已选中，可切换到“个股分析”查看完整详情。")
+            if d2.button("－ 删除选中股票",use_container_width=True):
+                code=str(rr["代码"]).zfill(6)
+                state["watchlist"]=[x for x in state["watchlist"] if str(x.get("代码","")).zfill(6)!=code]
+                state.get("snapshots",{}).pop(code,None)
                 _save_state(state); st.rerun()
 
-        st.divider(); st.subheader("📌 收盘后更新")
-        if st.button("更新购买建议 + 胜率变化",use_container_width=True):
-            today=eod_scan_date(); snaps=state.setdefault("snapshots",{}); prog=st.progress(0)
-            for i,item in enumerate(state["watchlist"]):
-                try:
-                    code=str(item["代码"]).zfill(6); r=refresh_watch_item(code,item.get("名称",""))
-                    hist=snaps.setdefault(code,{})
-                    prev=hist[sorted(hist)[-1]] if hist else None
-                    cur=r.pop("_snapshot"); hist[today]=cur
-                    r["胜率变化"]=None if prev is None or cur.get("winrate") is None or prev.get("winrate") is None else round(cur["winrate"]-prev["winrate"],1)
-                    r["变化原因"]="；".join(explain_winrate_change(prev,cur)); item.update(r)
-                except Exception as e: item["更新错误"]=str(e)[:80]
-                prog.progress((i+1)/max(len(state["watchlist"]),1))
-            _save_state(state); st.success("今日跟踪更新完成。"); st.rerun()
+        with st.expander("📋 查看全部候选 / 管理股票"):
+            allshow=[x for x in wanted if x in df.columns]
+            st.dataframe(df[allshow],use_container_width=True,hide_index=True)
+            delcode=st.selectbox("选择要删除的股票",["请选择"]+[f"{r['代码']} {r.get('名称','')}" for _,r in df.iterrows()])
+            if delcode!="请选择" and st.button("确认删除"):
+                code=delcode.split()[0]
+                state["watchlist"]=[x for x in state["watchlist"] if str(x.get("代码","")).zfill(6)!=code]
+                state.get("snapshots",{}).pop(code,None)
+                _save_state(state); st.rerun()
 
-        st.divider(); st.subheader("📈 胜率变化对比")
+        st.divider(); st.subheader("📈 胜率变化")
         comp=[]
         for item in state["watchlist"]:
-            code=str(item["代码"]).zfill(6); hist=state.get("snapshots",{}).get(code,{})
+            code=str(item.get("代码","")).zfill(6); hist=state.get("snapshots",{}).get(code,{})
             if hist:
                 dates=sorted(hist); cur=hist[dates[-1]]; prev=hist[dates[-2]] if len(dates)>=2 else None
                 comp.append({"代码":code,"名称":item.get("名称",""),"当前胜率":cur.get("winrate"),
                              "较上次":None if not prev or cur.get("winrate") is None or prev.get("winrate") is None else round(cur["winrate"]-prev["winrate"],1),
-                             "为什么变化":"；".join(explain_winrate_change(prev,cur))})
-        if comp:
-            st.dataframe(pd.DataFrame(comp),use_container_width=True,hide_index=True)
-            pick=st.selectbox("查看每日归因",["请选择"]+[f"{x['代码']} {x['名称']}" for x in comp])
-            if pick!="请选择":
-                code=pick.split()[0]; hist=state["snapshots"][code]; dates=sorted(hist)
-                for j in range(len(dates)-1,-1,-1):
-                    cur=hist[dates[j]]; prev=hist[dates[j-1]] if j>0 else None
-                    with st.expander(f"{dates[j]}｜胜率 {cur.get('winrate','—')}%"):
-                        for line in explain_winrate_change(prev,cur): st.write("• "+line)
-        else: st.caption("完成两次不同收盘日更新后，会显示胜率升降和原因。")
-
-        if state.get("deleted"):
-            with st.expander("🗑️ 本周已删除"): st.dataframe(pd.DataFrame(state["deleted"]),use_container_width=True,hide_index=True)
+                             "原因":"；".join(explain_winrate_change(prev,cur))})
+        if comp: st.dataframe(pd.DataFrame(comp),use_container_width=True,hide_index=True)
+        else: st.caption("至少完成两个不同收盘日的更新后显示变化。")
     else:
-        st.caption("当前本周股票池为空。")
+        st.info("候选池为空。先在上方粘贴多个6位股票代码，然后点“添加并分析”。")
 
 
 if page=="🔎 个股分析":
