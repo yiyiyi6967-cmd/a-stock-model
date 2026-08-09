@@ -1,5 +1,7 @@
 import streamlit as st
 import json
+import sqlite3
+import shutil
 from pathlib import Path
 import pandas as pd, numpy as np, akshare as ak
 from datetime import datetime,timedelta
@@ -108,7 +110,7 @@ def market_snapshot():
 
 @st.cache_data(ttl=60*60*12,show_spinner=False)
 def representative_universe():
-    """V8.0：只保留沪深主板；不扫描全A，使用代表性指数池。"""
+    """V8.4：只保留沪深主板；不扫描全A，使用代表性指数池。"""
     pools=[("沪深核心","000300",35),("中盘","000905",30),("小盘","000852",30)]
     frames=[];errors=[]
     def main_board(code):
@@ -1176,17 +1178,166 @@ def eod_scan_date():
     return str(d)
 
 
+DB_FILE=Path(__file__).with_name("stock_model_v82.db")
+
+def _db():
+    con=sqlite3.connect(DB_FILE)
+    con.execute("CREATE TABLE IF NOT EXISTS app_state(id INTEGER PRIMARY KEY,payload TEXT,updated_at TEXT)")
+    con.execute("""CREATE TABLE IF NOT EXISTS kline_cache(
+        code TEXT, trade_date TEXT, payload TEXT,
+        PRIMARY KEY(code,trade_date))""")
+    con.commit(); return con
+
+def db_load_state():
+    try:
+        with _db() as con:
+            row=con.execute("SELECT payload FROM app_state WHERE id=1").fetchone()
+        return json.loads(row[0]) if row else None
+    except Exception:return None
+
+def db_save_state(state):
+    try:
+        with _db() as con:
+            con.execute("""INSERT INTO app_state(id,payload,updated_at) VALUES(1,?,?)
+            ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at""",
+            (json.dumps(state,ensure_ascii=False),datetime.now().isoformat(timespec="seconds")))
+            con.commit()
+    except Exception:pass
+
+def cache_hist(code,raw):
+    try:
+        if raw is None or raw.empty:return
+        rows=[]
+        for _,r in raw.iterrows():
+            d=str(r.get("日期",""))[:10]
+            if not d:continue
+            rows.append((str(code).zfill(6),d,json.dumps(r.to_dict(),ensure_ascii=False,default=str)))
+        with _db() as con:
+            con.executemany("""INSERT INTO kline_cache(code,trade_date,payload) VALUES(?,?,?)
+            ON CONFLICT(code,trade_date) DO UPDATE SET payload=excluded.payload""",rows)
+            con.commit()
+    except Exception:pass
+
+def cached_hist(code):
+    try:
+        with _db() as con:
+            rows=con.execute("SELECT payload FROM kline_cache WHERE code=? ORDER BY trade_date",
+                             (str(code).zfill(6),)).fetchall()
+        return pd.DataFrame([json.loads(x[0]) for x in rows]) if rows else None
+    except Exception:return None
+
+def cache_stats():
+    try:
+        with _db() as con:
+            return con.execute("SELECT COUNT(DISTINCT code),COUNT(*) FROM kline_cache").fetchone()
+    except Exception:return (0,0)
+
+
+def migrate_legacy_json_bytes(data):
+    """导入V7/V8旧版watchlist JSON；尽量保留候选池、快照、淘汰记录和持仓。"""
+    old=json.loads(data.decode("utf-8-sig"))
+    if not isinstance(old,dict):
+        raise ValueError("旧版JSON格式不正确")
+    cur=_load_state()
+    for key in ["watchlist","deleted","eliminated","holdings"]:
+        vals=old.get(key,[])
+        if isinstance(vals,list):
+            # 按股票代码去重；无代码记录也尽量保留
+            existing={str(x.get("代码","")).zfill(6) for x in cur.get(key,[]) if isinstance(x,dict)}
+            for x in vals:
+                if not isinstance(x,dict): continue
+                code=str(x.get("代码","")).zfill(6)
+                if code and code!="000000" and code in existing: continue
+                cur.setdefault(key,[]).append(x)
+                if code: existing.add(code)
+    snaps=old.get("snapshots",{})
+    if isinstance(snaps,dict):
+        for code,hist in snaps.items():
+            if isinstance(hist,dict):
+                cur.setdefault("snapshots",{}).setdefault(str(code).zfill(6),{}).update(hist)
+    _save_state(cur)
+    return cur
+
+def migrate_legacy_db_bytes(data):
+    """导入V8.2/V8.3数据库：合并状态和K线，不要求直接覆盖当前数据库。"""
+    incoming=Path(__file__).with_name("_legacy_import.db")
+    try:
+        incoming.write_bytes(data)
+        with sqlite3.connect(incoming) as con:
+            chk=con.execute("PRAGMA integrity_check").fetchone()
+            if not chk or str(chk[0]).lower()!="ok":
+                raise ValueError("旧数据库完整性检查失败")
+            tables={r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            old_state=None
+            if "app_state" in tables:
+                row=con.execute("SELECT payload FROM app_state WHERE id=1").fetchone()
+                if row: old_state=json.loads(row[0])
+            klines=con.execute("SELECT code,trade_date,payload FROM kline_cache").fetchall() if "kline_cache" in tables else []
+        if old_state:
+            migrate_legacy_json_bytes(json.dumps(old_state,ensure_ascii=False).encode("utf-8"))
+        if klines:
+            with _db() as out:
+                out.executemany("""INSERT INTO kline_cache(code,trade_date,payload) VALUES(?,?,?)
+                    ON CONFLICT(code,trade_date) DO UPDATE SET payload=excluded.payload""",klines)
+                out.commit()
+        return len(klines)
+    finally:
+        try:
+            if incoming.exists(): incoming.unlink()
+        except Exception: pass
+
+def backup_database_bytes():
+    """生成一致性的SQLite备份，而不是直接读取正在使用的数据库文件。"""
+    tmp=Path(__file__).with_name("_stock_model_backup.db")
+    try:
+        if tmp.exists(): tmp.unlink()
+        with _db() as src, sqlite3.connect(tmp) as out:
+            src.backup(out)
+        data=tmp.read_bytes()
+        return data
+    finally:
+        try:
+            if tmp.exists(): tmp.unlink()
+        except Exception: pass
+
+def restore_database_bytes(data):
+    """校验并恢复数据库。恢复前自动保留当前数据库的安全副本。"""
+    incoming=Path(__file__).with_name("_incoming_restore.db")
+    safety=Path(__file__).with_name("stock_model_v82_before_restore.db")
+    try:
+        incoming.write_bytes(data)
+        with sqlite3.connect(incoming) as con:
+            chk=con.execute("PRAGMA integrity_check").fetchone()
+            if not chk or str(chk[0]).lower()!="ok":
+                raise ValueError("数据库完整性检查失败")
+            tables={r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if not {"app_state","kline_cache"}.issubset(tables):
+                raise ValueError("不是本模型的有效备份数据库")
+        if DB_FILE.exists():
+            shutil.copy2(DB_FILE,safety)
+        shutil.copy2(incoming,DB_FILE)
+        return True
+    finally:
+        try:
+            if incoming.exists(): incoming.unlink()
+        except Exception: pass
+
 STATE_FILE=Path(__file__).with_name("v70_watchlist.json")
 
 def _load_state():
+    z=db_load_state()
+    if z is not None:return z
     try:
-        if STATE_FILE.exists(): return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except Exception: pass
-    return {"week":"","watchlist":[],"deleted":[],"snapshots":{}}
+        if STATE_FILE.exists():
+            z=json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            db_save_state(z); return z
+    except Exception:pass
+    return {"week":"","watchlist":[],"deleted":[],"eliminated":[],"holdings":[],"snapshots":{}}
 
 def _save_state(state):
-    try: STATE_FILE.write_text(json.dumps(state,ensure_ascii=False,indent=2),encoding="utf-8")
-    except Exception: pass
+    db_save_state(state)
+    try:STATE_FILE.write_text(json.dumps(state,ensure_ascii=False,indent=2),encoding="utf-8")
+    except Exception:pass
 
 def week_key():
     now=datetime.now(ZoneInfo("Asia/Shanghai")); y,w,_=now.isocalendar()
@@ -1280,7 +1431,27 @@ def weekly_top20(scan_day):
     return out
 
 def refresh_watch_item(code,name=""):
-    raw,hsrc,_=get_hist(code); x=feat(raw).reset_index(drop=True)
+    # V8.4：缓存是“完整历史底座”，新行情只是增量。
+    # 每次分析前把缓存历史 + 本次新数据按日期合并、去重、排序，
+    # 因此所有指标/历史相似/样本外统计始终基于完整时间序列。
+    old_cache=cached_hist(code)
+    fresh=None; hsrc="SQLite缓存"
+    try:
+        fresh,hsrc,_=get_hist(code)
+        if fresh is not None and not fresh.empty:
+            cache_hist(code,fresh)
+    except Exception:
+        fresh=None
+    merged=[]
+    if old_cache is not None and not old_cache.empty: merged.append(old_cache)
+    if fresh is not None and not fresh.empty: merged.append(fresh)
+    if not merged: raise RuntimeError("行情接口和本地缓存均无可用历史数据")
+    raw=pd.concat(merged,ignore_index=True)
+    if "日期" in raw.columns:
+        raw["日期"]=pd.to_datetime(raw["日期"],errors="coerce")
+        raw=raw.dropna(subset=["日期"]).sort_values("日期").drop_duplicates("日期",keep="last").reset_index(drop=True)
+    cache_hist(code,raw)
+    x=feat(raw).reset_index(drop=True)
     sim=similar(x); reli=winrate_reliability(sim); chip=chip_model(x,None)
     ts,ps,hs,ns,sev,sigs,qd=score(x,sim,pd.DataFrame()); trend=trend_engine_v63(x); ts=trend["score"]
     s1,s2,r1,r2,lo,hi,b1,b2,sl,t1,t2,pull=levels(x)
@@ -1298,8 +1469,8 @@ def refresh_watch_item(code,name=""):
             "5日胜率":snap["winrate"],"现价":snap["close"],"建议买入":f'{pp["buy_lo"]:.2f}–{pp["buy_hi"]:.2f}',
             "第一卖出":f'{pp["sell1_lo"]:.2f}–{pp["sell1_hi"]:.2f}',"止损":round(pp["stop"],2),"_snapshot":snap}
 
-st.title("📈 A股短线模型 V8.0")
-st.caption("自选股票池 · 手动增删 · Top20排序 · 收盘后批量更新 · 胜率变化归因")
+st.title("📈 A股短线模型 V8.4")
+st.caption("持仓重点监控 · 全历史增量缓存 · 旧版迁移 · 数据库备份恢复 · 自选Top20")
 
 page=st.radio("模式",["⭐ 自选股票池","🔎 个股分析"],horizontal=True,label_visibility="collapsed")
 if "selected_code" not in st.session_state: st.session_state.selected_code="002159"
@@ -1308,9 +1479,123 @@ if page=="⭐ 自选股票池":
     state=_load_state()
     if "watchlist" not in state: state["watchlist"]=[]
     if "snapshots" not in state: state["snapshots"]={}
+    if "eliminated" not in state: state["eliminated"]=[]
+    if "holdings" not in state: state["holdings"]=[]
+    for _item in state["watchlist"]:
+        _item.setdefault("低质量连续天数",0)
+        _item.setdefault("低质量状态","0/3")
     st.subheader("⭐ 我的候选股票池")
     st.caption("你提供股票代码，模型只分析这些股票；不再扫描全A。支持批量添加、删除、更新和Top20排序。")
 
+    st.subheader("💼 我的持仓｜重点监控")
+    st.caption("持仓股不会因低质量3日规则被自动淘汰；重点判断继续持有、风险、止损与加仓条件。")
+    with st.expander("＋ 添加 / 修改持仓"):
+        hc=st.text_input("持仓股票代码（6位）",key="holding_code")
+        hcost=st.number_input("持仓成本",min_value=0.0,step=0.01,key="holding_cost")
+        hshares=st.number_input("持仓股数",min_value=0,step=100,key="holding_shares")
+        if st.button("保存持仓",use_container_width=True):
+            m=re.search(r"(\\d{6})",hc or "")
+            if not m: st.warning("请输入6位股票代码。")
+            else:
+                code=m.group(1); found=False
+                for h in state["holdings"]:
+                    if str(h.get("代码","")).zfill(6)==code:
+                        h.update({"成本":float(hcost),"股数":int(hshares)}); found=True
+                if not found: state["holdings"].append({"代码":code,"名称":"","成本":float(hcost),"股数":int(hshares)})
+                _save_state(state); st.rerun()
+
+    if state["holdings"]:
+        hrows=[]
+        for h in state["holdings"]:
+            code=str(h["代码"]).zfill(6)
+            # reuse latest candidate data if available; otherwise update on demand below
+            item=next((x for x in state["watchlist"] if str(x.get("代码","")).zfill(6)==code),{})
+            price=float(item.get("现价",0) or 0); cost=float(h.get("成本",0) or 0); shares=int(h.get("股数",0) or 0)
+            pnl=(price-cost)*shares if price and cost else None
+            pnlp=(price/cost-1)*100 if price and cost else None
+            quality=item.get("股票质量"); opp=item.get("当前机会"); conf=item.get("交易可信度")
+            action="等待更新"
+            if price and item:
+                stop=float(item.get("止损",0) or 0)
+                if stop and price<=stop: action="🔴 止损/减仓重点检查"
+                elif quality is not None and float(quality)<45: action="🟠 持仓风险升高"
+                elif opp is not None and float(opp)>=70 and conf is not None and float(conf)>=65: action="🟢 继续持有；加仓需等买入区"
+                else: action="🟡 继续观察"
+            hrows.append({"代码":code,"成本":cost,"股数":shares,"现价":price or None,
+                          "浮动盈亏":None if pnl is None else round(pnl,2),
+                          "收益率%":None if pnlp is None else round(pnlp,2),
+                          "股票质量":quality,"当前机会":opp,"交易可信度":conf,
+                          "止损":item.get("止损"),"第一卖出":item.get("第一卖出",item.get("目标1")),
+                          "持仓建议":action})
+        st.dataframe(pd.DataFrame(hrows),use_container_width=True,hide_index=True)
+        hc1,hc2=st.columns(2)
+        if hc1.button("🔄 更新全部持仓",use_container_width=True):
+            bar=st.progress(0)
+            for i,h in enumerate(state["holdings"]):
+                code=str(h["代码"]).zfill(6)
+                try:
+                    r=refresh_watch_item(code,h.get("名称","")); cur=r.pop("_snapshot",{})
+                    hist=state["snapshots"].setdefault(code,{})
+                    prev=hist[sorted(hist)[-1]] if hist else None
+                    hist[eod_scan_date()]=cur
+                    r["胜率变化"]=None if not prev or cur.get("winrate") is None or prev.get("winrate") is None else round(cur["winrate"]-prev["winrate"],1)
+                    r["变化原因"]="；".join(explain_winrate_change(prev,cur))
+                    existing=next((x for x in state["watchlist"] if str(x.get("代码","")).zfill(6)==code),None)
+                    if existing: existing.update(r)
+                    else:
+                        r["低质量连续天数"]=0; r["低质量状态"]="持仓保护"
+                        state["watchlist"].append(r)
+                except Exception as e:h["更新错误"]=str(e)[:100]
+                bar.progress((i+1)/len(state["holdings"]))
+            _save_state(state); st.rerun()
+        remove_h=hc2.selectbox("移除持仓",["请选择"]+[str(x["代码"]).zfill(6) for x in state["holdings"]],key="remove_holding")
+        if remove_h!="请选择" and st.button("确认移除持仓",use_container_width=True):
+            state["holdings"]=[x for x in state["holdings"] if str(x["代码"]).zfill(6)!=remove_h]
+            _save_state(state); st.rerun()
+    else:
+        st.info("暂无已标记持仓。")
+
+    stocks,bars=cache_stats()
+    st.caption(f"💾 本地行情缓存：{stocks} 只股票 / {bars} 条日K。分析时使用“历史缓存 + 最新数据”的完整合并序列。")
+    with st.expander("🗄️ 数据库备份 / 恢复"):
+        st.caption("备份包含：候选池、持仓、淘汰状态、每日快照以及已缓存日K。升级或重新部署前建议先下载备份。")
+        st.markdown("**旧版本数据迁移**")
+        legacy=st.file_uploader("导入旧版数据（支持 V7/V8 的 JSON 或 V8.2/V8.3 的 .db）",
+                                type=["json","db"],key="legacy_migrate")
+        if legacy is not None and st.button("📥 合并旧版数据",use_container_width=True):
+            try:
+                name=(legacy.name or "").lower()
+                if name.endswith(".db"):
+                    n=migrate_legacy_db_bytes(legacy.getvalue())
+                    st.success(f"旧数据库迁移完成，同时合并 {n} 条K线缓存。")
+                else:
+                    migrate_legacy_json_bytes(legacy.getvalue())
+                    st.success("旧版股票池/历史记录迁移完成。")
+                st.cache_data.clear(); st.rerun()
+            except Exception as e:
+                st.error(f"迁移失败：{e}")
+        st.caption("“迁移”采用合并方式，不会清空当前股票池；相同股票代码自动去重。")
+
+        try:
+            _backup=backup_database_bytes()
+            st.download_button("⬇️ 下载数据库备份",data=_backup,
+                               file_name="stock_model_backup.db",
+                               mime="application/octet-stream",
+                               use_container_width=True)
+        except Exception as e:
+            st.warning(f"暂时无法生成备份：{e}")
+        uploaded_db=st.file_uploader("上传之前的 .db 备份",type=["db"],key="restore_db")
+        if uploaded_db is not None:
+            st.warning("恢复会用备份内容替换当前模型数据库。")
+            if st.button("♻️ 确认恢复数据库",use_container_width=True):
+                try:
+                    restore_database_bytes(uploaded_db.getvalue())
+                    st.success("数据库恢复成功。页面将重新载入。")
+                    st.cache_data.clear()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"恢复失败：{e}")
+    st.divider()
     raw_codes=st.text_area(
         "批量输入股票代码",
         placeholder="例如：\n600519  000858  601318\n也支持逗号、空格或换行分隔",
@@ -1344,6 +1629,8 @@ if page=="⭐ 自选股票池":
                     r=refresh_watch_item(code,"")
                     snap=r.pop("_snapshot",{})
                     r["代码"]=code
+                    r["低质量连续天数"]=0
+                    r["低质量状态"]="0/3"
                     state["watchlist"].append(r)
                     state["snapshots"].setdefault(code,{})[eod_scan_date()]=snap
                 except Exception as e:
@@ -1364,11 +1651,28 @@ if page=="⭐ 自选股票池":
                 hist[today]=cur
                 r["胜率变化"]=None if not prev or cur.get("winrate") is None or prev.get("winrate") is None else round(cur["winrate"]-prev["winrate"],1)
                 r["变化原因"]="；".join(explain_winrate_change(prev,cur))
+                quality=float(r.get("股票质量",item.get("股票质量",0)) or 0)
+                low_count=(int(item.get("低质量连续天数",0) or 0)+1) if quality < 45 else 0
+                r["低质量连续天数"]=low_count
+                r["低质量状态"]=f"{min(low_count,3)}/3" if low_count else "0/3"
                 item.update(r)
             except Exception as e:
                 item["更新错误"]=str(e)[:100]
             bar.progress((i+1)/len(state["watchlist"]))
-        _save_state(state); bar.empty(); msg.success("全部更新完成。"); st.rerun()
+        survivors=[]; auto_removed=[]
+        holding_codes={str(x.get("代码","")).zfill(6) for x in state.get("holdings",[])}
+        for item in state["watchlist"]:
+            is_holding=str(item.get("代码","")).zfill(6) in holding_codes
+            if (not is_holding) and int(item.get("低质量连续天数",0) or 0)>=3:
+                moved=dict(item); moved["淘汰日期"]=today
+                moved["淘汰原因"]="股票质量连续3个收盘更新日低于45分"
+                state["eliminated"].append(moved); auto_removed.append(str(item.get("代码","")).zfill(6))
+            else:
+                survivors.append(item)
+        state["watchlist"]=survivors
+        _save_state(state); bar.empty()
+        msg.success(("更新完成；自动淘汰："+", ".join(auto_removed)) if auto_removed else "全部更新完成。")
+        st.rerun()
 
     if state["watchlist"]:
         df=pd.DataFrame(state["watchlist"])
@@ -1386,7 +1690,7 @@ if page=="⭐ 自选股票池":
         st.subheader(f"🏆 Top20（候选池 {len(df)} 只）")
         top=df.head(20)
         wanted=["排名","代码","名称","Top20评分","股票质量","当前机会","交易可信度","5日胜率",
-                "胜率变化","买入区","止损","目标1","目标2","变化原因","更新错误"]
+                "胜率变化","低质量状态","买入区","止损","目标1","目标2","变化原因","更新错误"]
         show=[x for x in wanted if x in top.columns]
         ev=st.dataframe(top[show],use_container_width=True,hide_index=True,
                         on_select="rerun",selection_mode="single-row",height=500)
@@ -1411,6 +1715,26 @@ if page=="⭐ 自选股票池":
                 state["watchlist"]=[x for x in state["watchlist"] if str(x.get("代码","")).zfill(6)!=code]
                 state.get("snapshots",{}).pop(code,None)
                 _save_state(state); st.rerun()
+
+        st.divider(); st.subheader("♻️ 自动淘汰池")
+        st.caption("股票质量连续3个收盘更新日低于45分后自动移出；历史快照保留，可恢复。")
+        if state.get("eliminated"):
+            edf=pd.DataFrame(state["eliminated"])
+            ecols=[c for c in ["代码","名称","股票质量","低质量状态","淘汰日期","淘汰原因"] if c in edf.columns]
+            st.dataframe(edf[ecols],use_container_width=True,hide_index=True)
+            restore=st.selectbox("恢复股票",["请选择"]+[f"{x.get('代码','')} {x.get('名称','')}" for x in state["eliminated"]])
+            if restore!="请选择" and st.button("恢复到候选池",use_container_width=True):
+                code=restore.split()[0]; kept=[]; restored=None
+                for x in state["eliminated"]:
+                    if restored is None and str(x.get("代码","")).zfill(6)==code: restored=dict(x)
+                    else: kept.append(x)
+                if restored:
+                    restored.pop("淘汰日期",None); restored.pop("淘汰原因",None)
+                    restored["低质量连续天数"]=0; restored["低质量状态"]="0/3"
+                    state["watchlist"].append(restored); state["eliminated"]=kept
+                    _save_state(state); st.rerun()
+        else:
+            st.caption("暂无自动淘汰股票。")
 
         st.divider(); st.subheader("📈 胜率变化")
         comp=[]
