@@ -108,8 +108,8 @@ def market_snapshot():
 
 @st.cache_data(ttl=60*60*12,show_spinner=False)
 def representative_universe():
-    """V7.0：只保留沪深主板；不扫描全A，使用代表性指数池。"""
-    pools=[("沪深核心","000300",90),("中盘","000905",80),("小盘","000852",80)]
+    """V7.1：只保留沪深主板；不扫描全A，使用代表性指数池。"""
+    pools=[("沪深核心","000300",35),("中盘","000905",30),("小盘","000852",30)]
     frames=[];errors=[]
     def main_board(code):
         code=str(code).zfill(6)
@@ -1222,7 +1222,11 @@ def explain_winrate_change(prev,cur):
 @st.cache_data(ttl=60*60*18,show_spinner=False)
 def weekly_top20(scan_day):
     universe=representative_universe(); light=[]; fail=0
-    for _,r in universe.iterrows():
+    status=st.empty()
+    progress=st.progress(0)
+    total_u=max(len(universe),1)
+    status.info(f"第一层：正在检查沪深主板候选的5日涨跌… 0/{len(universe)}")
+    for ii,(_,r) in enumerate(universe.iterrows()):
         code=str(r["代码"]).zfill(6)
         try:
             raw,hsrc,_=get_hist(code)
@@ -1232,10 +1236,16 @@ def weekly_top20(scan_day):
             light.append({"代码":code,"名称":r["名称"],"候选来源":r["候选来源"],"交易板块":r["交易板块"],
                           "5日涨跌":round(float(r5),2),"轻筛机会":q,"_raw":raw,"历史源":hsrc})
         except Exception: fail+=1
-    if not light:return pd.DataFrame()
+        progress.progress(min((ii+1)/total_u*.55,.55))
+        status.info(f"第一层：5日±2%过滤 {ii+1}/{len(universe)}｜当前符合 {len(light)} 只")
+    if not light:
+        progress.empty(); status.warning("5日±2%范围内暂无有效候选。")
+        return pd.DataFrame()
     light_df=pd.DataFrame(light).sort_values("轻筛机会",ascending=False)
-    picked=light_df.head(60).to_dict("records"); rows=[]
-    for r in picked:
+    picked=light_df.head(24).to_dict("records"); rows=[]
+    status.info(f"第二层：±2%后 {len(light_df)} 只，取快速评分前 {len(picked)} 只进入完整模型。")
+    total_p=max(len(picked),1)
+    for jj,r in enumerate(picked):
         try:
             code=str(r["代码"]).zfill(6); x=feat(r["_raw"]).reset_index(drop=True)
             sim=similar(x); reli=winrate_reliability(sim); chip=chip_model(x,None)
@@ -1256,9 +1266,15 @@ def weekly_top20(scan_day):
                          "5日胜率":round(wr*100,1) if np.isfinite(wr) else np.nan,"趋势状态":trend["state"],
                          "买入区":f'{pp["buy_lo"]:.2f}–{pp["buy_hi"]:.2f}',"止损":round(stop,2),
                          "目标1":f'{pp["sell1_lo"]:.2f}–{pp["sell1_hi"]:.2f}',"历史源":r["历史源"]})
-        except Exception: continue
-    if not rows:return pd.DataFrame()
+        except Exception: pass
+        progress.progress(min(.55+(jj+1)/total_p*.45,1.0))
+        status.info(f"第三层：完整模型 {jj+1}/{len(picked)}｜已成功 {len(rows)} 只")
+    progress.empty()
+    if not rows:
+        status.warning("完整模型暂未得到有效候选。")
+        return pd.DataFrame()
     out=pd.DataFrame(rows).sort_values(["综合评分","机会分","可信度"],ascending=False).head(20).reset_index(drop=True)
+    status.success(f"完成：完整评分 {len(rows)} 只，输出 Top {len(out)}。")
     out.index=out.index+1
     out.attrs.update({"universe_count":len(universe),"light_count":len(light_df),"deep_count":len(picked),"failed_count":fail})
     return out
@@ -1282,8 +1298,8 @@ def refresh_watch_item(code,name=""):
             "5日胜率":snap["winrate"],"现价":snap["close"],"建议买入":f'{pp["buy_lo"]:.2f}–{pp["buy_hi"]:.2f}',
             "第一卖出":f'{pp["sell1_lo"]:.2f}–{pp["sell1_hi"]:.2f}',"止损":round(pp["stop"],2),"_snapshot":snap}
 
-st.title("📈 A股短线模型 V7.0")
-st.caption("周末选股 · 工作日跟踪 · 沪深主板 · 5日±2%初筛 · 胜率变化归因")
+st.title("📈 A股短线模型 V7.1")
+st.caption("快速周选股 · 工作日跟踪 · 沪深主板 · 5日±2% · 最多24只深度评分")
 
 page=st.radio("模式",["📅 本周股票池","🔎 个股分析"],horizontal=True,label_visibility="collapsed")
 if "selected_code" not in st.session_state: st.session_state.selected_code="002159"
@@ -1291,7 +1307,7 @@ if "selected_code" not in st.session_state: st.session_state.selected_code="0021
 if page=="📅 本周股票池":
     state=_load_state(); wk=week_key()
     st.subheader("🏆 本周 Top20")
-    st.caption("仅沪深主板；最近5个交易日累计涨跌 -2%～+2% 初筛，最多60只进入完整模型。生成后本周冻结。")
+    st.caption("仅沪深主板；最近5个交易日累计涨跌 -2%～+2% 初筛，最多24只进入完整模型。生成后本周冻结。")
     if state.get("week")!=wk: st.info("新的一周尚未生成股票池。")
     if st.button("生成 / 重建本周 Top20",type="primary",use_container_width=True):
         with st.spinner("正在周度筛选…"): top=weekly_top20(eod_scan_date())
